@@ -29,6 +29,10 @@ gh api repos/<OWNER>/<REPO>/pulls/<NUMBER>/reviews
 
 # Commit history with timestamps
 gh api repos/<OWNER>/<REPO>/pulls/<NUMBER>/commits
+
+# CODEOWNERS (try .github/ first, then repo root)
+gh api repos/<OWNER>/<REPO>/contents/.github/CODEOWNERS --jq '.content' | base64 -d \
+  || gh api repos/<OWNER>/<REPO>/contents/CODEOWNERS --jq '.content' | base64 -d
 ```
 
 Extract any Jira ticket key(s) from the PR description. Match any `[A-Z]+-[0-9]+` pattern or Jira URL. Fetch each with the Atlassian Rovo MCP:
@@ -105,13 +109,13 @@ STCM flow:
 
 ---
 
-**5. Testing evidence valid** — Evidence demonstrates the specific change, on the correct environment, after the most recent commit.
+**5. Testing evidence valid** — Evidence demonstrates the specific change worked.
 - Evidence present (log output, screenshots, CI results)?
   - Standard flow: evidence is in the PR description.
   - STCM flow: evidence may be in the STCM ticket instead of the PR — check both.
-- Evidence timestamp is later than the last **code-changing** commit (a commit touching source code, logic, schema, or configuration — not documentation, comments, `.env.example`, or version bumps).
 - Evidence shows the specific behavior described in the change (not just "app starts")?
 - For low-risk changes, CI green is sufficient. For medium/high, prefer screenshots or live-environment log output — note if CI-only evidence is present for a non-low-risk change.
+- Do NOT compare screenshot or manual-test timestamps to commit timestamps. Test environments are deployed and tested independently, and evidence is typically captured before the final commit push. Timestamps on screenshots are irrelevant — only content matters.
 
 ---
 
@@ -138,7 +142,15 @@ STCM flow:
 
 ---
 
-### Part C: Verdict
+### Part C: CODEOWNERS gate
+
+After assessing the 7 criteria, check whether all required CODEOWNERS approvals are in:
+
+- Parse the CODEOWNERS file: each line is `<path-pattern> <owner> [<owner> ...]`. A pattern matches if the PR touches any file under that path. `*` matches everything.
+- For each pattern that matches the PR's changed files, check whether at least one of the listed owners has submitted an APPROVED review.
+- If any required owner group has not approved, list them explicitly — this does not change the 7-criteria verdict, but the PR is not actually mergeable and the EM comment should say so.
+
+### Part D: Verdict
 
 One of three:
 - **APPROVED** — all 7 criteria pass
@@ -174,6 +186,9 @@ Fill in the Notes column only for non-passing items — one clause is enough ("n
 
 If NOT APPROVED or PENDING, add a brief "**To reach approval:**" bullet list naming exactly what must change.
 
-If APPROVED, add one line: "Ready for EM sign-off — GitHub approval + checklist completion required before merge."
+If APPROVED with no pending CODEOWNERS, add one line: "Ready for EM sign-off — GitHub approval + checklist completion required before merge."
 
 If APPROVED and the STCM is pending manager/EM approval, replace that line with: "Approve [STCM-XXXXX](link) first, then submit GitHub approval here."
+
+If APPROVED but CODEOWNERS-required approvals are still pending, add instead:
+"⚠️ SOX criteria met, but the following required CODEOWNERS approvals are still outstanding — PR is not mergeable until these are in: `<owner/team>` (for `<path pattern>`)"
