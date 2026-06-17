@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Flow metrics: 8-week rolling kanban health report for a single Jira project.
-// Ported from pce-forecast/src/js/compute/flow-dashboard.js; no dependency on that project.
+// Flow metrics report: 8-week rolling kanban health for a single Jira project.
+// Ported from pce-forecast/src/js/compute/flow-dashboard.js +
+//   pce-forecast/src/js/compute/weekly-report.js; no dependency on that project.
 // Usage: node .claude/scripts/metrics.js [--project KEY]
 
 (function () {
@@ -27,8 +28,9 @@ const rawArgs = process.argv.slice(2);
 const pfIdx = rawArgs.indexOf('--project');
 const PROJECT = pfIdx !== -1 && rawArgs[pfIdx + 1] ? rawArgs[pfIdx + 1].toUpperCase() : 'PARCH';
 
-const LOOKBACK_WEEKS = 12;
-const DISCARD_STATUSES = new Set(['Discard', 'Discarded', 'Cancelled', "Won't Do"]);
+const LOOKBACK_WEEKS    = 12;
+const DISCARD_STATUSES  = new Set(['Discard', 'Discarded', 'Cancelled', "Won't Do"]);
+const SERVICE_DESK_TYPES = new Set(['Intake', 'Service Request', 'IT Help']);
 
 // ── Jira API ──────────────────────────────────────────────────────────────────
 
@@ -93,6 +95,12 @@ function p85(arr) {
   return arr[Math.max(0, Math.min(idx, arr.length - 1))];
 }
 
+// Convert 'focus:lava_support' → 'Lava Support'
+function labelName(label) {
+  return label.replace(/^focus:/, '').split(/[_\-\s]+/)
+    .map(w => w ? w[0].toUpperCase() + w.slice(1).toLowerCase() : '').join(' ').trim();
+}
+
 const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const MONTHS_LONG  = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
@@ -103,7 +111,7 @@ function esc(s) {
   return String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
 }
 
-// ── Card parsing ──────────────────────────────────────────────────────────────
+// ── Card and epic parsing ─────────────────────────────────────────────────────
 
 function buildCategoryMap(statusTypes) {
   const map = new Map();
@@ -145,7 +153,38 @@ function parseCard(issue, catMap) {
     flowStart: flowStartMs ? new Date(flowStartMs) : null,
     flowEnd:   flowEndMs   ? new Date(flowEndMs)   : null,
     created:   issue.fields.created ? new Date(issue.fields.created) : null,
+    parentKey: issue.fields.parent?.key ?? null,
+    labels: Array.isArray(issue.fields.labels) ? issue.fields.labels : [],
+    isServiceDesk: SERVICE_DESK_TYPES.has(issue.fields.issuetype?.name || ''),
   };
+}
+
+function parseEpic(issue, catMap) {
+  const statusCat = catMap.get(issue.fields.status?.name || '') || '';
+  return {
+    key: issue.key,
+    name: issue.fields.summary || '',
+    labels: Array.isArray(issue.fields.labels) ? issue.fields.labels : [],
+    isDone: statusCat === 'done',
+    status: issue.fields.status?.name || '',
+  };
+}
+
+// ── Epic stats from all cards ─────────────────────────────────────────────────
+
+function buildEpicStats(allCardsRaw, catMap) {
+  const stats = new Map();
+  for (const issue of allCardsRaw) {
+    const parentKey = issue.fields.parent?.key;
+    if (!parentKey) continue;
+    if (!stats.has(parentKey)) stats.set(parentKey, { totalCards: 0, doneCards: 0, remainingCards: 0 });
+    const s = stats.get(parentKey);
+    s.totalCards++;
+    const cat = catMap.get(issue.fields.status?.name || '') || '';
+    if (cat === 'done') s.doneCards++;
+    else s.remainingCards++;
+  }
+  return stats;
 }
 
 // ── SLE reconstruction ────────────────────────────────────────────────────────
@@ -168,13 +207,12 @@ function reconstructSle(cards, asOf, lookbackWeeks = LOOKBACK_WEEKS) {
   return cycleTimes.length ? Math.round(p85(cycleTimes) * 10) / 10 : null;
 }
 
-// ── Flow metrics computation ──────────────────────────────────────────────────
+// ── Flow metrics (8-week rolling) ─────────────────────────────────────────────
 
 function buildMetrics(cards, today) {
   const todayMs = today.getTime();
-  const curMon = getMondayStart(today);
+  const curMon  = getMondayStart(today);
 
-  // 8 Monday-aligned week starts, oldest first (index 0) → current (index 7)
   const weekStarts = Array.from({ length: 8 }, (_, i) => {
     const ws = new Date(curMon.getTime());
     ws.setDate(ws.getDate() - (7 - i) * 7);
@@ -203,8 +241,8 @@ function buildMetrics(cards, today) {
       return false;
     });
 
-    const cycleTimes = throughputCards.filter(c => c.cycleTime != null).map(c => c.cycleTime);
-    const medianCycleTime = arrMedian(cycleTimes);
+    const cycleTimes    = throughputCards.filter(c => c.cycleTime != null).map(c => c.cycleTime);
+    const medianCycleTime  = arrMedian(cycleTimes);
     const reconstructedSle = reconstructSle(cards, isCurrent ? today : weekStart);
 
     let sleHits = 0, sleMisses = 0;
@@ -233,7 +271,6 @@ function buildMetrics(cards, today) {
   let sleHitCount = 0, sleHitTotal = 0;
   complete.forEach(w => { sleHitCount += w.sleHits; sleHitTotal += w.sleHits + w.sleMisses; });
 
-  // At-risk active cards
   const breached = [], warning = [];
   let healthy = 0;
   for (const c of cards) {
@@ -242,16 +279,15 @@ function buildMetrics(cards, today) {
     if (fsMs === null) continue;
     const cardSle = reconstructSle(cards, new Date(fsMs));
     if (cardSle === null) continue;
-    const days = Math.round((todayMs - fsMs) / 86400000 * 10) / 10;
+    const days  = Math.round((todayMs - fsMs) / 86400000 * 10) / 10;
     const entry = { key: c.key, summary: c.summary, daysInFlight: days, sle: cardSle, status: c.status };
-    if (days > cardSle)               breached.push(entry);
-    else if (days / cardSle > 0.8)    warning.push(entry);
-    else                               healthy++;
+    if (days > cardSle)            breached.push(entry);
+    else if (days / cardSle > 0.8) warning.push(entry);
+    else                            healthy++;
   }
   breached.sort((a, b) => (b.daysInFlight - b.sle) - (a.daysInFlight - a.sle));
-  warning.sort((a, b) => (b.daysInFlight / b.sle) - (a.daysInFlight / a.sle));
+  warning.sort((a, b)  => (b.daysInFlight / b.sle) - (a.daysInFlight / a.sle));
 
-  // Trend direction (first 4 vs last 3 complete weeks)
   const firstAvg  = arrMean(complete.slice(0, 4).map(w => w.throughput));
   const secondAvg = arrMean(complete.slice(4, 7).map(w => w.throughput));
   const tpDir = secondAvg > firstAvg * 1.1 ? 'up' : secondAvg < firstAvg * 0.9 ? 'down' : 'flat';
@@ -264,26 +300,20 @@ function buildMetrics(cards, today) {
     ? (sMed < fMed * 0.9 ? 'improved' : sMed > fMed * 1.1 ? 'worsened' : 'stable')
     : 'stable';
 
-  const avgThroughput      = Math.round(arrMean(tpVals) * 10) / 10;
-  const lastWeekCount      = weeks[6].throughput;
-  const medianCycleTime    = allCt.length ? Math.round(arrMedian(allCt) * 10) / 10 : null;
-  const avgReconstructedSle = sleSamples.length ? Math.round(arrMean(sleSamples) * 10) / 10 : null;
-  const sleHitRate         = sleHitTotal > 0 ? Math.round(sleHitCount / sleHitTotal * 100) : null;
-
   return {
     generatedAt: new Date(),
     weeks,
     kpi: {
-      avgThroughput,
-      lastWeekCount,
-      lastWeekDelta: Math.round((lastWeekCount - avgThroughput) * 10) / 10,
-      stdDev: Math.round(arrStdDev(tpVals) * 10) / 10,
-      atRiskBreached: breached.length,
-      atRiskWarning:  warning.length,
-      atRiskHealthy:  healthy,
-      medianCycleTime,
-      avgReconstructedSle,
-      sleHitRate,
+      avgThroughput:       Math.round(arrMean(tpVals) * 10) / 10,
+      lastWeekCount:       weeks[6].throughput,
+      lastWeekDelta:       Math.round((weeks[6].throughput - arrMean(tpVals)) * 10) / 10,
+      stdDev:              Math.round(arrStdDev(tpVals) * 10) / 10,
+      atRiskBreached:      breached.length,
+      atRiskWarning:       warning.length,
+      atRiskHealthy:       healthy,
+      medianCycleTime:     allCt.length ? Math.round(arrMedian(allCt) * 10) / 10 : null,
+      avgReconstructedSle: sleSamples.length ? Math.round(arrMean(sleSamples) * 10) / 10 : null,
+      sleHitRate:          sleHitTotal > 0 ? Math.round(sleHitCount / sleHitTotal * 100) : null,
       sleHitCount,
       sleHitTotal,
     },
@@ -292,6 +322,144 @@ function buildMetrics(cards, today) {
     tpDir,
     cycleDir,
     currentSle: weeks[7].reconstructedSle,
+  };
+}
+
+// ── Throughput disclosure (last 7 days, by focus label → epic) ────────────────
+
+function buildThroughputData(cards, epicMap, epicStats, today) {
+  const sevenDaysAgo = new Date(today.getTime() - 7 * 86400000);
+
+  const lastWeekDone = cards.filter(c =>
+    c.tier === 'done' &&
+    !DISCARD_STATUSES.has(c.status) &&
+    c.flowEnd != null &&
+    c.flowEnd >= sevenDaysAgo
+  );
+
+  const total = lastWeekDone.length;
+  const byFocusRaw = {};
+  const serviceDesk = [], unassigned = [];
+
+  for (const card of lastWeekDone) {
+    const epic  = card.parentKey ? epicMap.get(card.parentKey) : null;
+    const entry = {
+      key: card.key,
+      url: `${BASE}/browse/${card.key}`,
+      summary: card.summary,
+      cycleTime: card.cycleTime != null ? Math.round(card.cycleTime) : null,
+    };
+
+    if (!epic) {
+      if (card.isServiceDesk) serviceDesk.push(entry);
+      else unassigned.push(entry);
+      continue;
+    }
+
+    const focusLabels = epic.labels.filter(l => l.startsWith('focus:'));
+
+    if (!focusLabels.length) {
+      unassigned.push(entry);
+      continue;
+    }
+
+    for (const label of focusLabels) {
+      if (!byFocusRaw[label]) byFocusRaw[label] = {};
+      if (!byFocusRaw[label][epic.key]) {
+        byFocusRaw[label][epic.key] = { key: epic.key, name: epic.name, cards: [] };
+      }
+      byFocusRaw[label][epic.key].cards.push(entry);
+    }
+  }
+
+  const byFocus = {};
+  let totalFocusSlots = 0;
+  for (const label of Object.keys(byFocusRaw).sort()) {
+    const groups = byFocusRaw[label];
+    let labelCount = 0;
+    const epics = Object.keys(groups).sort().map(ek => {
+      const g     = groups[ek];
+      const stats = epicStats.get(ek) || { totalCards: 0, doneCards: 0 };
+      labelCount += g.cards.length;
+      return {
+        key: g.key, url: `${BASE}/browse/${g.key}`, name: g.name,
+        blockedCards: 0, doneCards: stats.doneCards, totalCards: stats.totalCards,
+        cards: g.cards,
+      };
+    });
+    totalFocusSlots += labelCount;
+    byFocus[label] = {
+      displayName: labelName(label),
+      count: labelCount,
+      pct: total > 0 ? Math.round(labelCount / total * 100) : 0,
+      epics,
+    };
+  }
+
+  const sdCount = serviceDesk.length;
+  const unCount = unassigned.length;
+
+  return {
+    total,
+    byFocus,
+    multiLabelPresent: totalFocusSlots > (total - sdCount - unCount),
+    serviceDesk: { count: sdCount, pct: total > 0 ? Math.round(sdCount / total * 100) : 0, cards: serviceDesk },
+    unassigned:  { count: unCount, cards: unassigned },
+  };
+}
+
+// ── Next-up forecast (simple probabilistic simulation) ────────────────────────
+
+function forecastEpicCompletion(remainingCards, weeklyThroughputs, today) {
+  if (remainingCards <= 0) return today;
+  if (!weeklyThroughputs.length) return null;
+
+  const ITERATIONS = 500;
+  const completionWeeks = [];
+
+  for (let i = 0; i < ITERATIONS; i++) {
+    let rem = remainingCards, weeks = 0;
+    while (rem > 0 && weeks < 52) {
+      rem -= weeklyThroughputs[Math.floor(Math.random() * weeklyThroughputs.length)];
+      weeks++;
+    }
+    completionWeeks.push(rem <= 0 ? weeks : 52);
+  }
+
+  completionWeeks.sort((a, b) => a - b);
+  const p85weeks = completionWeeks[Math.ceil(0.85 * ITERATIONS) - 1];
+  if (p85weeks >= 52) return null;
+  return new Date(today.getTime() + p85weeks * 7 * 86400000);
+}
+
+function buildNextUp(epicMap, epicStats, weeklyThroughputs, today) {
+  const todayMs   = today.getTime();
+  const twoWeekMs = todayMs + 14 * 86400000;
+  const fourWeekMs = todayMs + 28 * 86400000;
+
+  const forecasted = [];
+
+  for (const [epicKey, stats] of epicStats) {
+    const epic = epicMap.get(epicKey);
+    if (!epic || epic.isDone) continue;
+    if (stats.remainingCards <= 0 || stats.doneCards === 0) continue;
+
+    const p85Date = forecastEpicCompletion(stats.remainingCards, weeklyThroughputs, today);
+    if (!p85Date || p85Date.getTime() > fourWeekMs) continue;
+
+    forecasted.push({
+      key: epic.key, url: `${BASE}/browse/${epic.key}`, name: epic.name,
+      pool: PROJECT, blockedCards: 0,
+      doneCards: stats.doneCards, totalCards: stats.totalCards,
+      p85: p85Date,
+    });
+  }
+
+  forecasted.sort((a, b) => a.p85.getTime() - b.p85.getTime());
+
+  return {
+    twoWeek:  forecasted.filter(i => i.p85.getTime() <= twoWeekMs),
+    extended: forecasted.filter(i => i.p85.getTime() >  twoWeekMs),
   };
 }
 
@@ -305,25 +473,23 @@ function buildNarrative({ kpi, tpDir, cycleDir }) {
     ? `Throughput is trending down over the past 8 weeks, averaging ${kpi.avgThroughput} cards/week.`
     : `Throughput is holding steady at roughly ${kpi.avgThroughput} cards/week.`);
 
-  if (kpi.medianCycleTime != null) {
+  if (kpi.medianCycleTime != null)
     parts.push(cycleDir === 'improved'
       ? `Cycle time has improved recently (median ${kpi.medianCycleTime}d across the window).`
       : cycleDir === 'worsened'
       ? `Cycle time has worsened recently (median ${kpi.medianCycleTime}d across the window).`
       : `Cycle time is stable (median ${kpi.medianCycleTime}d).`);
-  }
 
-  if (kpi.sleHitRate != null) {
+  if (kpi.sleHitRate != null)
     parts.push(kpi.sleHitRate >= 85
       ? `SLE hit rate is strong at ${kpi.sleHitRate}% when measured against each card's era commitment.`
       : kpi.sleHitRate >= 70
       ? `SLE hit rate is ${kpi.sleHitRate}% — below the 85% target when measured against era commitments.`
       : `SLE hit rate is low at ${kpi.sleHitRate}% — significantly below target when measured against era commitments.`);
-  }
 
   const urgentParts = [];
   if (kpi.atRiskBreached > 0) urgentParts.push(`${kpi.atRiskBreached} card${kpi.atRiskBreached !== 1 ? 's' : ''} past commitment`);
-  if (kpi.atRiskWarning > 0)  urgentParts.push(`${kpi.atRiskWarning} at risk`);
+  if (kpi.atRiskWarning  > 0) urgentParts.push(`${kpi.atRiskWarning} at risk`);
   if (urgentParts.length) parts.push(urgentParts.join(', ') + ' among active work.');
 
   return parts.join(' ');
@@ -342,31 +508,26 @@ function throughputSvg(weeks, avg) {
   const ly  = VH - 6;
 
   let s = `<svg viewBox="0 0 ${VW} ${VH}" width="100%" preserveAspectRatio="xMinYMin meet" xmlns="http://www.w3.org/2000/svg">`;
-
-  for (const v of [0, Math.round(yMax * 0.25), Math.round(yMax * 0.5), Math.round(yMax * 0.75), yMax]) {
+  for (const v of [0, Math.round(yMax*0.25), Math.round(yMax*0.5), Math.round(yMax*0.75), yMax]) {
     const y = yP(v);
     s += `<line x1="${ML}" y1="${y}" x2="${ML+PW}" y2="${y}" stroke="var(--color-border)" stroke-width="1" stroke-dasharray="2,2"/>`;
     s += `<text x="${ML-4}" y="${y+4}" text-anchor="end" font-size="9" fill="var(--color-text-secondary)">${v}</text>`;
   }
-
   weeks.forEach((w, i) => {
     const bH = Math.max((w.throughput / yMax) * PH, 0);
     const y  = MT + PH - bH;
     s += `<rect x="${xC(i)-bW/2}" y="${y}" width="${bW}" height="${bH}" fill="${w.isCurrent ? '#FFAB00' : '#4C9AFF'}" rx="2"/>`;
     if (w.throughput > 0) s += `<text x="${xC(i)}" y="${y-3}" text-anchor="middle" font-size="9" fill="var(--color-text-secondary)">${w.throughput}</text>`;
   });
-
   if (avg > 0) {
     const aY = yP(avg);
     s += `<line x1="${ML}" y1="${aY}" x2="${ML+PW}" y2="${aY}" stroke="#FF991F" stroke-width="1.5" stroke-dasharray="4,3"/>`;
     s += `<text x="${ML+PW+3}" y="${aY+4}" font-size="9" fill="#FF991F">avg</text>`;
   }
-
   weeks.forEach((w, i) => {
     const cx = xC(i), cy = MT + PH + 13;
     s += `<text transform="rotate(-45,${cx},${cy})" x="${cx}" y="${cy}" text-anchor="end" font-size="9" fill="var(--color-text-secondary)">${fmtShort(w.weekOf)}</text>`;
   });
-
   s += `<rect x="${ML}" y="${ly-7}" width="10" height="8" fill="#4C9AFF" rx="1"/>`;
   s += `<text x="${ML+13}" y="${ly}" font-size="9" fill="var(--color-text-secondary)">Throughput</text>`;
   s += `<rect x="${ML+90}" y="${ly-7}" width="10" height="8" fill="#FFAB00" rx="1"/>`;
@@ -393,13 +554,11 @@ function cycleTimeSvg(weeks, currentSle, avgSle) {
   const ly = VH - 6;
 
   let s = `<svg viewBox="0 0 ${VW} ${VH}" width="100%" preserveAspectRatio="xMinYMin meet" xmlns="http://www.w3.org/2000/svg">`;
-
-  for (const v of [0, Math.round(yMax * 0.25), Math.round(yMax * 0.5), Math.round(yMax * 0.75), yMax]) {
+  for (const v of [0, Math.round(yMax*0.25), Math.round(yMax*0.5), Math.round(yMax*0.75), yMax]) {
     const y = yP(v);
     s += `<line x1="${ML}" y1="${y}" x2="${ML+PW}" y2="${y}" stroke="var(--color-border)" stroke-width="1" stroke-dasharray="2,2"/>`;
     s += `<text x="${ML-4}" y="${y+4}" text-anchor="end" font-size="9" fill="var(--color-text-secondary)">${v}d</text>`;
   }
-
   const slePoints = [];
   weeks.forEach((w, i) => {
     if (w.reconstructedSle == null) return;
@@ -411,31 +570,23 @@ function cycleTimeSvg(weeks, currentSle, avgSle) {
     const lastSle = weeks[weeks.length - 1].reconstructedSle ?? currentSle ?? 0;
     s += `<text x="${ML+PW+3}" y="${yP(lastSle)+4}" font-size="9" fill="#DE350B">SLE</text>`;
   }
-
   const linePoints = [];
-  weeks.forEach((w, i) => {
-    if (w.medianCycleTime != null) linePoints.push(`${xC(i)},${yP(w.medianCycleTime)}`);
-  });
+  weeks.forEach((w, i) => { if (w.medianCycleTime != null) linePoints.push(`${xC(i)},${yP(w.medianCycleTime)}`); });
   if (linePoints.length > 1) s += `<polyline points="${linePoints.join(' ')}" fill="none" stroke="#4C9AFF" stroke-width="2"/>`;
-
   weeks.forEach((w, i) => {
     if (w.medianCycleTime == null) return;
     const overSle = w.reconstructedSle != null && w.medianCycleTime > w.reconstructedSle;
-    const fill = w.isCurrent ? '#FF991F' : overSle ? '#DE350B' : '#00875A';
-    s += `<circle cx="${xC(i)}" cy="${yP(w.medianCycleTime)}" r="4" fill="${fill}" stroke="white" stroke-width="1.5"/>`;
+    s += `<circle cx="${xC(i)}" cy="${yP(w.medianCycleTime)}" r="4" fill="${w.isCurrent ? '#FF991F' : overSle ? '#DE350B' : '#00875A'}" stroke="white" stroke-width="1.5"/>`;
   });
-
   weeks.forEach((w, i) => {
     const cx = xC(i), cy = MT + PH + 13;
     s += `<text transform="rotate(-45,${cx},${cy})" x="${cx}" y="${cy}" text-anchor="end" font-size="9" fill="var(--color-text-secondary)">${fmtShort(w.weekOf)}</text>`;
   });
-
   if (avgSle != null) {
     const ay = yP(avgSle);
     s += `<line x1="${ML}" y1="${ay}" x2="${ML+PW}" y2="${ay}" stroke="#FF991F" stroke-width="1" stroke-dasharray="6,3" opacity="0.7"/>`;
     s += `<text x="${ML+PW+3}" y="${ay+4}" font-size="9" fill="#FF991F">avg</text>`;
   }
-
   s += `<line x1="${ML}" y1="${ly-3}" x2="${ML+16}" y2="${ly-3}" stroke="#4C9AFF" stroke-width="2"/>`;
   s += `<circle cx="${ML+8}" cy="${ly-3}" r="3" fill="#00875A" stroke="white" stroke-width="1"/>`;
   s += `<text x="${ML+20}" y="${ly}" font-size="9" fill="var(--color-text-secondary)">Median CT</text>`;
@@ -449,7 +600,7 @@ function cycleTimeSvg(weeks, currentSle, avgSle) {
   return s;
 }
 
-// ── HTML generation ───────────────────────────────────────────────────────────
+// ── HTML sections ─────────────────────────────────────────────────────────────
 
 function kpiRow(kpi) {
   const dSign = kpi.lastWeekDelta >= 0 ? '+' : '';
@@ -494,33 +645,27 @@ function kpiRow(kpi) {
 
 function detailTable(weeks) {
   let h = '<table class="fm-detail-table"><thead><tr><th>Week of</th><th>Throughput</th><th>WIP</th><th>Median CT</th><th>SLE (era)</th><th>Hit Rate</th></tr></thead><tbody>';
-
   for (const w of weeks) {
-    const rowCls = w.isCurrent ? ' class="fm-current-week"' : '';
-    const end    = new Date(w.weekOf.getTime() + 6 * 86400000);
-    const label  = `${fmtShort(w.weekOf)} &ndash; ${fmtShort(end)}${w.isCurrent ? ' *' : ''}`;
-
+    const rowCls    = w.isCurrent ? ' class="fm-current-week"' : '';
+    const end       = new Date(w.weekOf.getTime() + 6 * 86400000);
+    const label     = `${fmtShort(w.weekOf)} &ndash; ${fmtShort(end)}${w.isCurrent ? ' *' : ''}`;
     const ctDisplay = w.medianCycleTime != null ? `${Math.round(w.medianCycleTime)}d` : '--';
     let ctClass = '';
     if (w.reconstructedSle != null && w.medianCycleTime != null)
       ctClass = w.medianCycleTime > w.reconstructedSle ? ' class="fm-sle-miss-red"' : w.medianCycleTime > w.reconstructedSle * 0.8 ? ' class="fm-sle-miss"' : '';
-
     const sleEraTd = w.reconstructedSle != null
       ? `<td>${w.isCurrent ? '<strong>' : ''}${w.reconstructedSle}d${w.isCurrent ? '</strong>' : ''}</td>`
       : '<td>--</td>';
-
     const hitTotal = w.sleHits + w.sleMisses;
     let hitTd;
-    if (w.isCurrent)       hitTd = '<td style="color:var(--color-text-secondary)">pending</td>';
+    if (w.isCurrent) hitTd = '<td style="color:var(--color-text-secondary)">pending</td>';
     else if (hitTotal > 0) {
       const pct = Math.round(w.sleHits / hitTotal * 100);
       const cls = pct >= 85 ? '' : pct >= 70 ? ' class="fm-sle-miss"' : ' class="fm-sle-miss-red"';
       hitTd = `<td${cls}>${pct}% (${w.sleHits}/${hitTotal})</td>`;
     } else hitTd = '<td>--</td>';
-
     h += `<tr${rowCls}><td>${label}</td><td>${w.throughput}</td><td>${w.wip}</td><td${ctClass}>${ctDisplay}</td>${sleEraTd}${hitTd}</tr>`;
   }
-
   h += '</tbody></table>';
   h += '<div style="font-size:var(--fs-xs);color:var(--color-text-secondary);margin-top:var(--sp-2)">* current week (partial)</div>';
   return h;
@@ -528,10 +673,8 @@ function detailTable(weeks) {
 
 function atRiskTable(breached, warning) {
   if (!breached.length && !warning.length) return '';
-
   let h = '<div class="fm-detail-section"><div class="fm-detail-title">Cards Requiring Attention</div>';
   h += '<table class="fm-detail-table"><thead><tr><th>Key</th><th>Status</th><th>Summary</th><th>In Flight</th><th>Commitment</th><th>Over / Left</th></tr></thead><tbody>';
-
   for (const c of breached) {
     const over = Math.round((c.daysInFlight - c.sle) * 10) / 10;
     h += `<tr>
@@ -543,7 +686,6 @@ function atRiskTable(breached, warning) {
       <td class="fm-sle-miss-red" style="white-space:nowrap;font-weight:var(--fw-bold)">+${over}d</td>
     </tr>`;
   }
-
   for (const c of warning) {
     const left = Math.round((c.sle - c.daysInFlight) * 10) / 10;
     h += `<tr>
@@ -555,12 +697,102 @@ function atRiskTable(breached, warning) {
       <td class="fm-sle-miss" style="white-space:nowrap">${left}d left</td>
     </tr>`;
   }
-
   h += '</tbody></table></div>';
   return h;
 }
 
-function generateHtml(data) {
+function throughputDisclosureHtml(T) {
+  const summary = `Completed last week: ${T.total} card${T.total !== 1 ? 's' : ''}`;
+  let inner = '';
+
+  if (T.total === 0) {
+    inner = '<p style="color:var(--color-text-secondary);margin:var(--sp-3) 0">No work completed last week.</p>';
+  } else {
+    for (const label of Object.keys(T.byFocus)) {
+      const f = T.byFocus[label];
+      inner += `<div style="margin-bottom:var(--sp-4)">`;
+      inner += `<div style="font-weight:var(--fw-semibold);font-size:var(--fs-sm);margin-bottom:var(--sp-2)">${esc(f.displayName)} <span style="color:var(--color-text-secondary);font-weight:normal">${f.count} card${f.count !== 1 ? 's' : ''} &middot; ${f.pct}%</span></div>`;
+      for (const ep of f.epics) {
+        inner += `<div style="margin-bottom:var(--sp-2);padding:var(--sp-2) var(--sp-3);background:var(--color-surface-alt);border-radius:var(--radius-sm);border-left:3px solid var(--color-border)">`;
+        inner += `<div style="font-size:var(--fs-sm);font-weight:var(--fw-semibold);margin-bottom:var(--sp-1)">`;
+        inner += `<a href="${ep.url}" target="_blank" style="color:var(--color-brand)">${ep.key}</a> &mdash; ${esc(ep.name)}`;
+        inner += `<span style="color:var(--color-text-secondary);font-weight:normal;font-size:var(--fs-xs);margin-left:var(--sp-2)">done: ${ep.doneCards} / ${ep.totalCards}${ep.blockedCards > 0 ? ` &middot; blocked: ${ep.blockedCards}` : ''}</span></div>`;
+        inner += `<table style="width:100%;border-collapse:collapse;font-size:var(--fs-xs)"><tbody>`;
+        for (const c of ep.cards) {
+          inner += `<tr><td style="white-space:nowrap;padding:2px var(--sp-2);text-align:left"><a href="${c.url}" target="_blank" style="color:var(--color-brand);font-weight:var(--fw-semibold)">${c.key}</a></td>`;
+          inner += `<td style="padding:2px var(--sp-2);width:100%;text-align:left">${esc(c.summary)}</td>`;
+          inner += `<td style="white-space:nowrap;padding:2px var(--sp-2);text-align:right;color:var(--color-text-secondary)">${c.cycleTime !== null ? `CT: ${c.cycleTime}d` : ''}</td></tr>`;
+        }
+        inner += `</tbody></table></div>`;
+      }
+      inner += `</div>`;
+    }
+
+    if (T.serviceDesk.count > 0) {
+      inner += `<div style="margin-bottom:var(--sp-4)">`;
+      inner += `<div style="font-weight:var(--fw-semibold);font-size:var(--fs-sm);margin-bottom:var(--sp-2)">Service Desk Intake <span style="color:var(--color-text-secondary);font-weight:normal">${T.serviceDesk.count} card${T.serviceDesk.count !== 1 ? 's' : ''} &middot; ${T.serviceDesk.pct}%</span></div>`;
+      inner += `<table style="width:100%;border-collapse:collapse;font-size:var(--fs-xs)"><tbody>`;
+      for (const c of T.serviceDesk.cards) {
+        inner += `<tr><td style="white-space:nowrap;padding:2px var(--sp-2)"><a href="${c.url}" target="_blank" style="color:var(--color-brand);font-weight:var(--fw-semibold)">${c.key}</a></td>`;
+        inner += `<td style="padding:2px var(--sp-2)">${esc(c.summary)}</td>`;
+        inner += `<td style="white-space:nowrap;padding:2px var(--sp-2);color:var(--color-text-secondary)">${c.cycleTime !== null ? `${c.cycleTime}d` : '--'}</td></tr>`;
+      }
+      inner += `</tbody></table></div>`;
+    }
+
+    if (T.unassigned.count > 0) {
+      inner += `<div style="margin-bottom:var(--sp-4)">`;
+      inner += `<div style="font-weight:var(--fw-semibold);font-size:var(--fs-sm);margin-bottom:var(--sp-2);color:var(--color-warning)">Unassigned (no epic) <span style="font-weight:normal">${T.unassigned.count} card${T.unassigned.count !== 1 ? 's' : ''}</span></div>`;
+      inner += `<table style="width:100%;border-collapse:collapse;font-size:var(--fs-xs)"><tbody>`;
+      for (const c of T.unassigned.cards) {
+        inner += `<tr><td style="white-space:nowrap;padding:2px var(--sp-2)"><a href="${c.url}" target="_blank" style="color:var(--color-brand);font-weight:var(--fw-semibold)">${c.key}</a></td>`;
+        inner += `<td style="padding:2px var(--sp-2)">${esc(c.summary)}</td>`;
+        inner += `<td style="white-space:nowrap;padding:2px var(--sp-2);color:var(--color-text-secondary)">${c.cycleTime !== null ? `${c.cycleTime}d` : '--'}</td></tr>`;
+      }
+      inner += `</tbody></table></div>`;
+    }
+
+    if (T.multiLabelPresent)
+      inner += `<p style="font-size:var(--fs-xs);color:var(--color-text-secondary);margin-top:var(--sp-2)">Percentages may exceed 100% when epics carry multiple focus: labels.</p>`;
+  }
+
+  return `<details class="fm-throughput-disclosure"><summary class="fm-throughput-summary">${summary}</summary><div class="fm-throughput-body">${inner}</div></details>`;
+}
+
+function nextUpDisclosureHtml(nextUp) {
+  const total = nextUp.twoWeek.length + nextUp.extended.length;
+  if (total === 0) return '';
+
+  const summary = `Up next: ${total} epic${total !== 1 ? 's' : ''} forecast to complete`;
+
+  function epicRow(item) {
+    const blockedPart = item.blockedCards > 0
+      ? ` <span style="color:var(--color-danger);font-size:var(--fs-xs)">${item.blockedCards} blocked</span>` : '';
+    return `<tr>
+      <td style="white-space:nowrap;padding:3px var(--sp-2);text-align:left"><a href="${item.url}" target="_blank" style="color:var(--color-brand);font-weight:var(--fw-semibold)">${item.key}</a></td>
+      <td style="padding:3px var(--sp-2);width:100%;text-align:left">${esc(item.name)}${blockedPart}</td>
+      <td style="white-space:nowrap;padding:3px var(--sp-2);text-align:right;color:var(--color-text-secondary)">${item.doneCards}/${item.totalCards} done</td>
+      <td style="white-space:nowrap;padding:3px var(--sp-2);text-align:right;font-weight:var(--fw-semibold)">P85: ${esc(fmtShort(item.p85))}</td>
+    </tr>`;
+  }
+
+  let inner = '<table style="width:100%;border-collapse:collapse;font-size:var(--fs-xs);margin:0"><tbody>';
+  if (nextUp.twoWeek.length > 0) {
+    inner += `<tr><td colspan="4" style="padding:var(--sp-2) var(--sp-2) var(--sp-1);font-size:var(--fs-xs);font-weight:var(--fw-semibold);color:var(--color-text-secondary);text-transform:uppercase;letter-spacing:0.4px">Next 2 weeks</td></tr>`;
+    for (const item of nextUp.twoWeek) inner += epicRow(item);
+  }
+  if (nextUp.extended.length > 0) {
+    inner += `<tr><td colspan="4" style="padding:var(--sp-3) var(--sp-2) var(--sp-1);font-size:var(--fs-xs);font-weight:var(--fw-semibold);color:var(--color-text-secondary);text-transform:uppercase;letter-spacing:0.4px">Weeks 3&ndash;4</td></tr>`;
+    for (const item of nextUp.extended) inner += epicRow(item);
+  }
+  inner += '</tbody></table>';
+
+  return `<details class="fm-throughput-disclosure"><summary class="fm-throughput-summary">${summary}</summary><div class="fm-throughput-body">${inner}</div></details>`;
+}
+
+// ── Full HTML document ────────────────────────────────────────────────────────
+
+function generateHtml(data, throughputData, nextUp) {
   const { generatedAt, weeks, kpi, breached, warning, tpDir, cycleDir, currentSle } = data;
 
   const css = `
@@ -572,9 +804,9 @@ a:hover{color:var(--color-brand-hover);text-decoration:underline}
 :root{
 --color-bg:#F8F9FB;--color-surface:#FFFFFF;--color-surface-alt:#F4F5F7;--color-surface-hover:#EBECF0;
 --color-border:#DFE1E6;--color-border-light:#EBECF0;
---color-text:#172B4D;--color-text-secondary:#6B778C;--color-text-muted:#97A0AF;--color-text-inverse:#FFFFFF;
---color-brand:#0052CC;--color-brand-hover:#0747A6;--color-brand-light:#DEEBFF;
---color-success:#00875A;--color-success-bg:#E3FCEF;--color-success-border:#ABF5D1;
+--color-text:#172B4D;--color-text-secondary:#6B778C;--color-text-muted:#97A0AF;
+--color-brand:#0052CC;--color-brand-hover:#0747A6;
+--color-success:#00875A;--color-success-bg:#E3FCEF;
 --color-warning:#FF8B00;--color-warning-bg:#FFFAE6;--color-warning-border:#FFE380;
 --color-danger:#DE350B;--color-danger-bg:#FFEBE6;--color-danger-border:#FFBDAD;
 --color-info:#0065FF;--color-info-bg:#DEEBFF;--color-info-border:#B3D4FF;
@@ -584,8 +816,8 @@ a:hover{color:var(--color-brand-hover);text-decoration:underline}
 --fw-normal:400;--fw-medium:500;--fw-semibold:600;--fw-bold:700;
 --lh-tight:1.25;--lh-normal:1.5;
 --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:20px;--sp-6:24px;--sp-8:32px;--sp-10:40px;--sp-12:48px;
---radius-sm:4px;--radius-md:8px;--radius-lg:12px;--radius-full:9999px;
---shadow-sm:0 1px 2px rgba(23,43,77,.04);--shadow-md:0 2px 8px rgba(23,43,77,.08);
+--radius-sm:4px;--radius-md:8px;--radius-full:9999px;
+--shadow-sm:0 1px 2px rgba(23,43,77,.04);
 }
 body{font-family:var(--font-family);font-size:var(--fs-base);line-height:var(--lh-normal);color:var(--color-text);background:var(--color-bg)}
 h1,h2,h3,h4{font-weight:var(--fw-semibold);line-height:var(--lh-tight)}
@@ -617,7 +849,13 @@ h1{font-size:var(--fs-xl)}h2{font-size:var(--fs-lg)}h3{font-size:var(--fs-md)}h4
 .fm-detail-table tr.fm-current-week td{background:var(--color-warning-bg)}
 .fm-sle-miss{color:var(--color-warning);font-weight:var(--fw-semibold)}
 .fm-sle-miss-red{color:var(--color-danger);font-weight:var(--fw-semibold)}
-.fm-narrative{background:var(--color-info-bg);border:1px solid var(--color-info-border);border-radius:var(--radius-md);padding:var(--sp-4) var(--sp-5);font-size:var(--fs-sm);color:var(--color-text);line-height:var(--lh-normal)}
+.fm-narrative{background:var(--color-info-bg);border:1px solid var(--color-info-border);border-radius:var(--radius-md);padding:var(--sp-4) var(--sp-5);font-size:var(--fs-sm);color:var(--color-text);line-height:var(--lh-normal);margin-bottom:var(--sp-3)}
+.fm-throughput-disclosure{margin-top:var(--sp-3);border:1px solid var(--color-border);border-radius:var(--radius-md)}
+.fm-throughput-summary{cursor:pointer;padding:var(--sp-3) var(--sp-4);font-size:var(--fs-sm);font-weight:var(--fw-semibold);color:var(--color-text);list-style:none;display:flex;align-items:center;gap:var(--sp-2);user-select:none}
+.fm-throughput-summary::-webkit-details-marker{display:none}
+.fm-throughput-summary::before{content:'▶';font-size:.65em;color:var(--color-text-secondary);transition:transform .15s;flex-shrink:0}
+details[open] .fm-throughput-summary::before{transform:rotate(90deg)}
+.fm-throughput-body{padding:var(--sp-3) var(--sp-4) var(--sp-4);border-top:1px solid var(--color-border)}
 @media(max-width:700px){.fm-kpi-row{grid-template-columns:repeat(2,1fr)}.fm-charts{grid-template-columns:1fr}}
 `;
 
@@ -645,6 +883,8 @@ h1{font-size:var(--fs-xl)}h2{font-size:var(--fs-lg)}h3{font-size:var(--fs-md)}h4
   </div>
   ${atRiskTable(breached, warning)}
   <div class="fm-narrative">${esc(buildNarrative(data))}</div>
+  ${throughputDisclosureHtml(throughputData)}
+  ${nextUpDisclosureHtml(nextUp)}
 </div>`;
 
   return `<!DOCTYPE html>
@@ -664,33 +904,46 @@ ${body}
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 (async () => {
-  process.stderr.write(`Fetching ${PROJECT} issues from Jira...\n`);
+  process.stderr.write(`Fetching ${PROJECT} data from Jira...\n`);
 
-  const [statusTypes, inProgress, done] = await Promise.all([
+  const [statusTypes, inProgressIssues, doneIssues, allCardsRaw, epicIssues] = await Promise.all([
     jiraGet(`/rest/api/3/project/${PROJECT}/statuses`),
     searchAll(
       `project = ${PROJECT} AND statusCategory = "In Progress" AND issuetype != Epic`,
-      'summary,status,statuscategorychangedate,created',
+      'summary,status,statuscategorychangedate,created,parent,labels,issuetype',
       'changelog'
     ),
     searchAll(
       `project = ${PROJECT} AND statusCategory = Done AND issuetype != Epic AND updated >= "-180d"`,
-      'summary,status,statuscategorychangedate,created',
+      'summary,status,statuscategorychangedate,created,parent,labels,issuetype',
       'changelog'
+    ),
+    searchAll(
+      `project = ${PROJECT} AND issuetype != Epic`,
+      'summary,status,parent,issuetype'
+    ),
+    searchAll(
+      `project = ${PROJECT} AND issuetype = Epic`,
+      'summary,status,labels'
     ),
   ]);
 
-  process.stderr.write(`Fetched ${inProgress.length} in-progress, ${done.length} done issues. Computing metrics...\n`);
+  process.stderr.write(`Fetched: ${inProgressIssues.length} in-progress, ${doneIssues.length} done (180d), ${allCardsRaw.length} all cards, ${epicIssues.length} epics. Computing...\n`);
 
-  const catMap = buildCategoryMap(statusTypes);
-  const cards  = [...inProgress, ...done].map(i => parseCard(i, catMap));
+  const catMap   = buildCategoryMap(statusTypes);
+  const cards    = [...inProgressIssues, ...doneIssues].map(i => parseCard(i, catMap));
+  const epicMap  = new Map(epicIssues.map(i => [i.key, parseEpic(i, catMap)]));
+  const epicStats = buildEpicStats(allCardsRaw, catMap);
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  const data = buildMetrics(cards, today);
-  const html = generateHtml(data);
+  const data           = buildMetrics(cards, today);
+  const weeklyThroughputs = data.weeks.slice(0, 7).map(w => w.throughput).filter(t => t > 0);
+  const throughputData = buildThroughputData(cards, epicMap, epicStats, today);
+  const nextUp         = buildNextUp(epicMap, epicStats, weeklyThroughputs, today);
 
+  const html    = generateHtml(data, throughputData, nextUp);
   const outPath = require('path').resolve(process.cwd(), 'metrics.html');
   require('fs').writeFileSync(outPath, html, 'utf8');
 
@@ -700,4 +953,6 @@ ${body}
   console.log(`Throughput: ${kpi.avgThroughput} cards/week avg | last week: ${kpi.lastWeekCount} | std dev: ±${kpi.stdDev}`);
   console.log(`SLE hit rate: ${kpi.sleHitRate != null ? kpi.sleHitRate + '%' : 'n/a'} (${kpi.sleHitCount}/${kpi.sleHitTotal})`);
   console.log(`At risk: ${kpi.atRiskBreached} breached, ${kpi.atRiskWarning} warning, ${kpi.atRiskHealthy} healthy`);
+  console.log(`Last week: ${throughputData.total} cards completed`);
+  console.log(`Next up: ${nextUp.twoWeek.length} within 2 weeks, ${nextUp.extended.length} within 4 weeks`);
 })().catch(e => { console.error(e.message); process.exit(1); });
