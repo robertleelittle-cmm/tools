@@ -70,6 +70,21 @@ Runs a PARCH kanban standup report (default project). Override with `--project K
 
 **PTO handling:** active PTO suppresses backlog suggestions; upcoming PTO (within 7 days) is flagged on the engineer's line.
 
+## /goalsetting
+
+Guides any McKesson Platform employee through the annual Workday goal-setting process. Produces SMART goals aligned to the three Platform evaluation criteria.
+
+**Usage:** `/goalsetting` (no arguments; starts an interactive interview)
+
+**Requires:** No external tools. Pure Claude skill.
+
+**What it produces:**
+- 3–4 performance goals (What You Deliver) and 1–2 development goals (How You Grow), reviewed individually with SMART scoring before finalization
+- A single markdown artifact per goal with GOAL, DESCRIPTION, and MILESTONES sections
+- Optional post-delivery advice on executing each goal for elevated or exceptional performance
+
+**Flow:** Interview (job context or prewritten goals) → per-goal SMART review → artifact → optional performance execution review.
+
 ## /metadoc
 
 Produces canonical meta-documents: reference documents that define what must be true or what must exist within a documentation hierarchy. Does **not** produce the project documents that fulfill those requirements -- those live in project folios and reference back to the meta-document.
