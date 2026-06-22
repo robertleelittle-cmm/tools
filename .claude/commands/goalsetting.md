@@ -90,7 +90,53 @@ responsibilities and their team's priorities.
 current role and team. They should feel achievable and be grounded in the employee's
 actual growth areas, not generic aspirations.
 
-All goals must follow this statement format:
+### What makes a goal appropriate
+
+A goal must pass all four of these tests before it is drafted or accepted:
+
+**Outcome-focused, not activity-based.** A goal describes what will be achieved, not
+what will be done. If removing the goal would not change what the employee does day-to-day,
+it is not a goal — it is a job description. Watch for activity language and revise to state
+the result:
+- ❌ "Support the team's delivery process" → ✅ "Reduce average PR review cycle time from
+  3 days to 1 day by establishing review norms and maintaining coverage, measured quarterly"
+- ❌ "Assist with cross-team documentation" → ✅ "Produce and publish runbooks for the
+  three most-requested integration patterns, reducing cross-team support requests by 30%"
+- ❌ "Participate in architecture discussions" → ✅ "Drive and document the architecture
+  decision for [initiative], resulting in an approved ADR and team alignment by Q2"
+
+Activity-language disqualifiers: "support," "assist," "participate in," "contribute to,"
+"help with," "be involved in," "serve as." Any of these signals the goal describes a task,
+not an outcome. Push back and ask what the outcome of that activity will be.
+
+**Role-appropriate scope.** Goals must reflect what the employee directly drives or
+significantly influences — not what their team does or what the organization hopes to
+achieve. Scope should match the employee's level:
+- Individual contributors: delivery, technical outcomes, and reliability for systems they
+  own or significantly contribute to
+- Tech leads and staff engineers: technical direction, cross-team technical coordination,
+  team capability development
+- Managers and senior managers: team effectiveness, cross-team strategy, organizational
+  outcomes driven through their team
+
+A goal that requires the employee to control outcomes outside their direct influence is
+inappropriate. A goal that could be accepted as "meeting expectations" simply by showing up
+is also inappropriate.
+
+**Connected to a team or business priority.** If a goal could have been written without
+knowing the team's actual priorities, it is too generic. Every goal should trace to at
+least one stated team priority or organizational outcome.
+
+**Provides evidence for at least one evaluation criterion.** Every goal should naturally
+produce evidence for one or more of the three Platform evaluation criteria (see below).
+If a goal cannot be connected to any of the three, it is likely the wrong goal. The three
+criteria are: (1) technical delivery with business impact, (2) team capability and process
+improvement, (3) cross-team understanding and collaboration. A well-chosen goal often
+provides evidence for more than one.
+
+### Goal statement format
+
+All goals must follow this format:
 > [Specific action] + [Measurable criteria] + [Achievable scope] + [Relevant context] + [Time-bound deadline]
 
 Examples:
@@ -118,13 +164,27 @@ For each drafted goal, present:
 1. The goal statement (~30 words)
 2. A bullet for each SMART criterion: how the goal satisfies it (or where it falls short)
 3. A rating out of 10 for how well the goal meets SMART criteria overall
+4. Which Platform evaluation criterion (or criteria) this goal provides evidence for, and
+   how — one sentence per criterion it touches
 
 Then ask: is this goal acceptable, should it be revised, or should it be dropped?
 
-Before accepting any goal as final, verify:
-- Clear connection to the employee's actual responsibilities and team priorities
-- Realistic metrics based on current baseline performance
-- Sufficient specificity to enable quarterly milestone tracking
+Before accepting any goal as final, verify all of the following. If any check fails, flag
+it and require revision before proceeding:
+
+- **Outcome test**: is the goal stated as a result, not an activity? Does it use any
+  activity-language disqualifiers ("support," "assist," "participate," "contribute to")?
+  If so, it must be revised to state the outcome of that activity.
+- **Role-focus test**: does this goal describe a specific, defined outcome above baseline
+  expectations? Or does it describe what the employee would do as part of their normal job?
+  A goal that is simply "doing the job" is inappropriate.
+- **Scope test**: is this goal within the employee's direct control or significant
+  influence? Does it match the scope expectations for their level?
+- **Priority connection**: does this goal trace to at least one stated team priority?
+- **Rubric connection**: does this goal provide evidence for at least one of the three
+  Platform evaluation criteria? If none, it likely needs to be reconsidered.
+- **Baseline and metrics**: are the metrics grounded in current performance? Are there
+  enough specifics to enable quarterly milestone tracking?
 
 Do this for each goal individually. Do not batch goals for review. Only proceed to Phase 4
 once all goals are confirmed.
@@ -232,8 +292,11 @@ SMART checklist:
 
 ## Platform Evaluation Rubric
 
-Platform employees are evaluated against these three criteria in quarterly and annual
-reviews. Goals should be designed to provide evidence for manager evaluation against them.
+The rubric serves two purposes: (1) employees are evaluated against these criteria in
+quarterly and annual reviews, and (2) the criteria are a quality filter for whether a
+goal is the right goal to set. Every goal should connect to at least one criterion. Goals
+that cannot be connected to any criterion are likely activity-based, role-descriptive, or
+outside the appropriate scope.
 
 ### 1. Deliver Reliable Technical Solutions with Business Impact
 *"How effectively did you deliver solutions that meet business needs while maintaining
