@@ -14,7 +14,7 @@
 // Context stash: persistent defaults loaded from .claude/standup-context.json
 const ctx = (() => {
   const fs = require('fs'), path = require('path');
-  const f = path.resolve(__dirname, '../standup-context.json');
+  const f = path.resolve(process.env.HOME || require('os').homedir(), '.claude/standup-context.json');
   try { return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : {}; } catch { return {}; }
 })();
 
@@ -762,10 +762,5 @@ console.log = (...args) => { _origLog(...args); };
     'utf8',
   );
   console.log('HTML_OUT:' + _sOut);
-  const { execSync: _execSync } = require('child_process');
-  try {
-    const _opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start ""' : 'xdg-open';
-    _execSync(`${_opener} "${_sOut}"`);
-  } catch {}
 
 })().catch(e => { console.error(e.message); process.exit(1); });
