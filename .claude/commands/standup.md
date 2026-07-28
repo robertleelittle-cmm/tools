@@ -109,14 +109,21 @@ After injecting recommendations, use AskUserQuestion with:
    ```
    Report "No changes at HH:MM." and stop.
 6. **If different:**
-   a. Run the full standup (with GitHub): `node /Users/robert.little/.claude/scripts/owen-standup.js <cliArgs>`
-   b. Extract new Team Status section from stdout.
-   c. Diff old vs. new Team Status line by line. Identify: status changes, new/resolved PRs, cards added or removed, age threshold crossings.
-   d. Format changes as an HTML list: `<ul><li>PARCH-NNN: In Progress → In Review</li>…</ul>`
-   e. Prepend a new entry to the monitoring log in the HTML (keep last 10 entries max):
-      ```html
-      <div class="monitor-entry"><span class="monitor-time">HH:MM</span> — <ul><li>…</li></ul></div>
+   a. Diff old (`snapshotTeamStatus`) vs. new Team Status line by line to build a plain-text change list. For each difference identify: status changes (`PARCH-NNN: Old → New`), cards added or removed, PR state changes. Produce a JSON array of short strings, e.g. `["PARCH-786: In Review → Done","PARCH-999 added for Ivan"]`.
+   b. Run the full standup (with GitHub) in **draft mode** — writes a separate draft file without opening the browser:
       ```
-      Replace `<!-- MONITORING_LOG_PLACEHOLDER -->` on the first entry; thereafter prepend before existing entries inside `<div id="monitor-log">`.
-   f. Update `snapshotTeamStatus` in the state file with the new Team Status section.
-   g. Report: "Board updated at HH:MM: [summary of changes]"
+      node /Users/robert.little/.claude/scripts/owen-standup.js --draft <cliArgs>
+      ```
+      Get DRAFT_PATH from the `HTML_OUT:` line in stdout.
+   c. Run the update helper to merge the draft into the live file. Pass the current time (`HH:MM`) and the JSON change array:
+      ```
+      node /Users/robert.little/.claude/skills/owen/.claude/scripts/update-live-standup.js \
+        --live <htmlPath from state file> \
+        --draft <DRAFT_PATH> \
+        --time <HH:MM> \
+        --changes '<JSON array from step a>'
+      ```
+      The helper: replaces the Kanban metrics and Team Status sections with fresh data; diffs the recommendations by `<h3>` block (added sections get a ✚ green marker, removed sections get a ✕ strikethrough); prepends the new change entry to the Live Updates log; writes the merged result to the live path.
+   d. Extract the new Team Status section from the full standup stdout and update `snapshotTeamStatus` in the state file.
+   e. Delete the draft file: `rm <DRAFT_PATH>`
+   f. Report: "Board updated at HH:MM: [summary of changes from step a]"
