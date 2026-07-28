@@ -98,9 +98,9 @@ After injecting recommendations, use AskUserQuestion with:
    - Delete the state file: `rm /tmp/standup-monitor-state.json`
    - Report: "Standup monitoring ended."
    - Stop.
-3. Run the standup script with `--skip-github` plus the stored cliArgs to get a fast Jira snapshot:
+3. Run the standup script with `--skip-github --no-html` plus the stored cliArgs to get a fast Jira snapshot (the `--no-html` flag prevents overwriting the existing standup page):
    ```
-   node /Users/robert.little/.claude/scripts/owen-standup.js --skip-github <cliArgs>
+   node /Users/robert.little/.claude/scripts/owen-standup.js --skip-github --no-html <cliArgs>
    ```
 4. Extract the Team Status section from stdout (same bounds as above).
 5. **If identical to `snapshotTeamStatus`:** prepend to the monitoring log in the HTML:

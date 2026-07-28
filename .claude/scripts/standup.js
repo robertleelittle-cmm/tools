@@ -49,6 +49,7 @@ const excludeTerms = [
     : []),
 ];
 const skipGithub = rawArgs.includes('--skip-github');
+const noHtml = rawArgs.includes('--no-html');
 const isExcluded = name => excludeTerms.length > 0 && excludeTerms.some(t => normalizeN(name).includes(t));
 
 // Team membership: engineers active within this window are included even if idle now
@@ -769,28 +770,30 @@ console.log = (...args) => { _origLog(...args); };
   const medianDays = cycleTimes.length ? Math.round(percentile(cycleTimes, 0.5) / 86400000) : 0;
   const _sDate = new Date().toISOString().slice(0, 10);
   const _sOut = _path.join(_os.tmpdir(), `standup-${_sDate}.html`);
-  _fs.writeFileSync(
-    _sOut,
-    generateStandupHtml({
-      dateLabel: todayLabel,
-      nationalDay: pickedNationalDay,
-      sleDays: computedSleDays,
-      medianDays,
-      sampleCount: cycleTimes.length,
-      plannedReadyCount,
-      runwayWeeks,
-      rows,
-      engineerEntries,
-      available,
-      availSuggestions,
-    }),
-    'utf8',
-  );
-  console.log('HTML_OUT:' + _sOut);
-  const { execSync: _execSync } = require('child_process');
-  try {
-    const _opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start ""' : 'xdg-open';
-    _execSync(`${_opener} "${_sOut}"`);
-  } catch {}
+  if (!noHtml) {
+    _fs.writeFileSync(
+      _sOut,
+      generateStandupHtml({
+        dateLabel: todayLabel,
+        nationalDay: pickedNationalDay,
+        sleDays: computedSleDays,
+        medianDays,
+        sampleCount: cycleTimes.length,
+        plannedReadyCount,
+        runwayWeeks,
+        rows,
+        engineerEntries,
+        available,
+        availSuggestions,
+      }),
+      'utf8',
+    );
+    console.log('HTML_OUT:' + _sOut);
+    const { execSync: _execSync } = require('child_process');
+    try {
+      const _opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start ""' : 'xdg-open';
+      _execSync(`${_opener} "${_sOut}"`);
+    } catch {}
+  }
 
 })().catch(e => { console.error(e.message); process.exit(1); });
