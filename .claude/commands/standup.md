@@ -103,13 +103,18 @@ After injecting recommendations, use AskUserQuestion with:
    node /Users/robert.little/.claude/scripts/owen-standup.js --skip-github --no-html <cliArgs>
    ```
 4. Extract the Team Status section from stdout (same bounds as above).
-5. **If identical to `snapshotTeamStatus`:** prepend to the monitoring log in the HTML:
+4.5. **Merged PR scan for "In Review" cards:** Even when Team Status looks unchanged, Jira lags behind GitHub merges. For each ticket `PARCH-NNN` that appears as "In Review" in `snapshotTeamStatus`, run:
+   ```bash
+   gh pr list --repo covermymeds/drugs-api --state merged --search "PARCH-NNN" --json number,title,mergedAt,author --limit 3 2>/dev/null
+   ```
+   If any PR has a `mergedAt` timestamp within the last 2 hours, collect it as an extra change: `"PARCH-NNN: PR #NNN merged by AUTHOR — card still In Review, needs transition to Done"`. If any such PRs are found, treat the run as "different" and include these entries in the changes array for step 6a (even if the Jira Team Status text is identical).
+5. **If identical to `snapshotTeamStatus` AND no merged PRs found in step 4.5:** prepend to the monitoring log in the HTML:
    ```html
    <div class="monitor-entry"><span class="monitor-time">HH:MM</span> — <span class="monitor-nochange">No changes.</span></div>
    ```
    Report "No changes at HH:MM." and stop.
-6. **If different:**
-   a. Diff old (`snapshotTeamStatus`) vs. new Team Status line by line to build a plain-text change list. For each difference identify: status changes (`PARCH-NNN: Old → New`), cards added or removed, PR state changes. Produce a JSON array of short strings, e.g. `["PARCH-786: In Review → Done","PARCH-999 added for Ivan"]`.
+6. **If different (Team Status changed OR merged PRs found in step 4.5):**
+   a. Diff old (`snapshotTeamStatus`) vs. new Team Status line by line to build a plain-text change list. For each difference identify: status changes (`PARCH-NNN: Old → New`), cards added or removed, PR state changes. Merge in any merged-PR entries collected in step 4.5. Produce a JSON array of short strings, e.g. `["PARCH-786: In Review → Done","PARCH-999 added for Ivan","PARCH-786: PR #140 merged — card still In Review"]`.
    b. Run the full standup (with GitHub) in **draft mode** — writes a separate draft file without opening the browser:
       ```
       node /Users/robert.little/.claude/scripts/owen-standup.js --draft <cliArgs>
