@@ -69,11 +69,8 @@ function extractMonitorEntries(html) {
 
 function replaceMonitorCard(html, newEntries, time) {
   const checkedSpan = `<span id="monitor-last-checked" style="font-size:.8rem;font-weight:400;color:#6b7280">— checked ${time}</span>`;
-  return html.replace(
-    /(<div class="card" id="monitoring")[^>]*>([\s\S]*?id="monitor-log">)([\s\S]*?)(<\/div>\s*<\/div>)/,
-    (_, cardOpen, _logOpen, _old, closeTag) =>
-      `${cardOpen}><h2>Live Updates ${checkedSpan}</h2><div id="monitor-log">${newEntries}${closeTag}`,
-  );
+  const newCard = `\n<div class="card" id="monitoring"><h2>Live Updates ${checkedSpan}</h2><div id="monitor-log">${newEntries}</div></div>\n`;
+  return replaceSection(html, 'monitor', newCard);
 }
 
 // ── Recommendations diff ─────────────────────────────────────────────────────
@@ -120,10 +117,8 @@ function buildDiffedRecs(oldSections, newSections) {
 
 if (noChanges) {
   const liveHtml = fs.readFileSync(livePath, 'utf8');
-  const checkedSpan = `<span id="monitor-last-checked" style="font-size:.8rem;font-weight:400;color:#6b7280">— checked ${timeStr}</span>`;
-  let updated = liveHtml
-    .replace(/<span id="monitor-last-checked"[^>]*>[^<]*<\/span>/, checkedSpan)
-    .replace(/(<div class="card" id="monitoring")[^>]*>/, '$1>');
+  const existingEntries = extractMonitorEntries(liveHtml);
+  const updated = replaceMonitorCard(liveHtml, existingEntries || '', timeStr);
   fs.writeFileSync(livePath, updated, 'utf8');
   console.log(JSON.stringify({ success: true, time: timeStr, noChanges: true }));
   process.exit(0);
