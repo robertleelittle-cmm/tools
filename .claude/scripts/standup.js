@@ -608,7 +608,9 @@ console.log = (...args) => { _origLog(...args); };
       '<div class="card" id="recommendations"><h2>Recommendations</h2><div id="recs-content"><!-- RECOMMENDATIONS_PLACEHOLDER --></div></div>\n' +
       '<div class="card" id="monitoring" style="display:none"><h2>Live Updates</h2><div id="monitor-log"><!-- MONITORING_LOG_PLACEHOLDER --></div></div>\n' +
       '<div class="card"><h2>Availability and Upcoming Events</h2>' + avHtml + '</div>\n' +
-      '</div>\n<div id="wip-tip"></div>\n<script>' + js + '<\/script>\n</body>\n</html>';
+      '</div>\n<div id="wip-tip"></div>\n<script>' + js + '<\/script>\n' +
+      '<script>(function(){var _kl=document.getElementById(\'monitor-log\')&&document.getElementById(\'monitor-log\').innerHTML;setInterval(function(){var xhr=new XMLHttpRequest();xhr.open(\'GET\',location.href,true);xhr.onload=function(){try{var doc=new DOMParser().parseFromString(xhr.responseText,\'text/html\');var nl=doc.getElementById(\'monitor-log\');var ol=document.getElementById(\'monitor-log\');var mc=document.getElementById(\'monitoring\');if(nl&&ol&&nl.innerHTML!==_kl){_kl=nl.innerHTML;ol.innerHTML=_kl;if(mc)mc.style.display=\'\';}var nr=doc.getElementById(\'recs-content\');var or2=document.getElementById(\'recs-content\');if(nr&&or2&&nr.innerHTML.indexOf(\'RECOMMENDATIONS_PLACEHOLDER\')===-1&&or2.innerHTML.indexOf(\'RECOMMENDATIONS_PLACEHOLDER\')!==-1){or2.innerHTML=nr.innerHTML;}}catch(e){}};xhr.send();},15000);})();<\/script>\n' +
+      '</body>\n</html>';
   }
 
   // Group in-flight rows by engineer; sort each engineer's cards right-to-left then longest first
