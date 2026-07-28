@@ -139,10 +139,13 @@ if (cutIdx !== -1) allEntries = allEntries.substring(0, cutIdx);
 
 const oldRecsInner = extractRecsInner(liveHtml);
 const newRecsInner = extractRecsInner(draftHtml);
+// Draft may contain only a placeholder — treat as "no real recs" if no <h3> present
+const newHasRealRecs = newRecsInner && newRecsInner.includes('<h3>');
 const oldSecs = parseRecSections(oldRecsInner);
-const newSecs = parseRecSections(newRecsInner);
+const newSecs = newHasRealRecs ? parseRecSections(newRecsInner) : [];
 
-let mergedRecsInner = newRecsInner || oldRecsInner || '';
+// Preserve live recs when draft only has a placeholder
+let mergedRecsInner = newHasRealRecs ? newRecsInner : (oldRecsInner || '');
 let recsAdded = [], recsRemoved = [];
 if (oldSecs.length > 0 && newSecs.length > 0) {
   const diff = buildDiffedRecs(oldSecs, newSecs);
