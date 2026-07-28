@@ -47,3 +47,76 @@ Recommendations must cover:
 Format recommendations as markdown. Use headers, bold text, and bullet lists -- no pipe tables. Every ticket reference must be a markdown link to its Jira card (https://covermymeds.atlassian.net/browse/ISSUE-nnn). Name engineers and tickets specifically, but frame actions as questions and suggestions, not orders. Prioritize by flow impact, not by age alone.
 
 After generating recommendations, identify the output path from the `HTML_OUT:` line in stdout, then use the Edit tool on that file to replace `<!-- RECOMMENDATIONS_PLACEHOLDER -->` with the recommendations formatted as HTML. Use `<h3>` for section headers, `<p>` for paragraphs, `<ul>`/`<li>` for lists, `<strong>` for bold, and `<a href="...">` for ticket links. Do not include the outer `<h2>Recommendations</h2>` heading -- that is already in the file.
+
+Finally, open `standup.html` in the browser by running: `open standup.html`
+
+---
+
+## Live Board Monitoring (optional)
+
+After injecting recommendations, use AskUserQuestion with:
+- header: "Live updates"
+- question: "Monitor the Jira board for changes and auto-update the standup page?"
+- options:
+  1. label: "Every 2 min for 30 min", description: "Recommended default — checks every 2 minutes and updates the page if anything changes."
+  2. label: "Custom interval", description: "Specify your own check interval and duration."
+  3. label: "No monitoring", description: "Skip live updates."
+
+**If "No monitoring":** stop here.
+
+**If "Every 2 min for 30 min" or "Custom interval":**
+
+1. If custom, ask: "How often and for how long? (e.g. '5 min for 1 hour')" and parse INTERVAL_MINUTES and DURATION_MINUTES. Default: 2 min / 30 min.
+2. Extract the **Team Status section** from the standup stdout: everything from `## Team Status` up to (but not including) `## Multi-Ticket Owners`.
+3. Write `/tmp/standup-monitor-state.json`:
+   ```json
+   {
+     "htmlPath": "<HTML_OUT path from stdout>",
+     "snapshotTeamStatus": "<extracted Team Status markdown>",
+     "cliArgs": "<the CLI args used, e.g. '--exclude \"Derik Pell\"', or empty string>",
+     "expiresAt": <Math.floor(Date.now()/1000) + DURATION_MINUTES * 60>,
+     "cronJobId": null
+   }
+   ```
+4. Use CronCreate:
+   - cron: `*/<INTERVAL_MINUTES> * * * *`
+   - recurring: true
+   - prompt: `Standup monitoring check — follow the ## Monitoring Protocol in the owen-standup skill.`
+5. Update the state file: replace `"cronJobId": null` with the returned job ID string.
+6. Report: "Monitoring active — checking every N min until HH:MM."
+
+---
+
+## Monitoring Protocol
+
+**This section runs when the CronCreate job fires.**
+
+1. Run `cat /tmp/standup-monitor-state.json`. If missing or empty, stop silently.
+2. Parse the state. If `Date.now()/1000 > expiresAt`:
+   - Use CronDelete with the cronJobId.
+   - In the HTML at htmlPath, replace `<!-- MONITORING_LOG_PLACEHOLDER -->` with `<div class="monitor-entry"><span class="monitor-time">HH:MM</span> — <span class="monitor-nochange">Monitoring ended.</span></div>` (preserving any existing log entries before it).
+   - Delete the state file: `rm /tmp/standup-monitor-state.json`
+   - Report: "Standup monitoring ended."
+   - Stop.
+3. Run the standup script with `--skip-github` plus the stored cliArgs to get a fast Jira snapshot:
+   ```
+   node /Users/robert.little/.claude/scripts/owen-standup.js --skip-github <cliArgs>
+   ```
+4. Extract the Team Status section from stdout (same bounds as above).
+5. **If identical to `snapshotTeamStatus`:** prepend to the monitoring log in the HTML:
+   ```html
+   <div class="monitor-entry"><span class="monitor-time">HH:MM</span> — <span class="monitor-nochange">No changes.</span></div>
+   ```
+   Report "No changes at HH:MM." and stop.
+6. **If different:**
+   a. Run the full standup (with GitHub): `node /Users/robert.little/.claude/scripts/owen-standup.js <cliArgs>`
+   b. Extract new Team Status section from stdout.
+   c. Diff old vs. new Team Status line by line. Identify: status changes, new/resolved PRs, cards added or removed, age threshold crossings.
+   d. Format changes as an HTML list: `<ul><li>PARCH-NNN: In Progress → In Review</li>…</ul>`
+   e. Prepend a new entry to the monitoring log in the HTML (keep last 10 entries max):
+      ```html
+      <div class="monitor-entry"><span class="monitor-time">HH:MM</span> — <ul><li>…</li></ul></div>
+      ```
+      Replace `<!-- MONITORING_LOG_PLACEHOLDER -->` on the first entry; thereafter prepend before existing entries inside `<div id="monitor-log">`.
+   f. Update `snapshotTeamStatus` in the state file with the new Team Status section.
+   g. Report: "Board updated at HH:MM: [summary of changes]"
