@@ -16,14 +16,16 @@ const livePath = arg('--live');
 const draftPath = arg('--draft');
 const timeStr = arg('--time') || new Date().toTimeString().slice(0, 5);
 const changesRaw = arg('--changes');
+const noChanges = process.argv.includes('--no-changes');
 
-if (!livePath || !draftPath) {
-  console.error('Usage: update-live-standup.js --live <path> --draft <path> [--time HH:MM] [--changes \'[...]\']');
+if (!livePath) {
+  console.error('Usage: update-live-standup.js --live <path> [--draft <path>] [--time HH:MM] [--changes \'[...]\'] [--no-changes]');
   process.exit(1);
 }
-
-const liveHtml = fs.readFileSync(livePath, 'utf8');
-const draftHtml = fs.readFileSync(draftPath, 'utf8');
+if (!noChanges && !draftPath) {
+  console.error('--draft is required unless --no-changes is set');
+  process.exit(1);
+}
 
 // ── Section extraction using <!-- SEC:X --> / <!-- /SEC:X --> markers ──────
 
@@ -65,12 +67,12 @@ function extractMonitorEntries(html) {
   return m[1].replace('<!-- MONITORING_LOG_PLACEHOLDER -->', '').trim();
 }
 
-function replaceMonitorCard(html, newEntries) {
-  // Also make the card visible (remove display:none) and update log contents
+function replaceMonitorCard(html, newEntries, time) {
+  const checkedSpan = `<span id="monitor-last-checked" style="font-size:.8rem;font-weight:400;color:#6b7280">— checked ${time}</span>`;
   return html.replace(
     /(<div class="card" id="monitoring")[^>]*>([\s\S]*?id="monitor-log">)([\s\S]*?)(<\/div>\s*<\/div>)/,
-    (_, cardOpen, logOpen, _old, closeTag) =>
-      `${cardOpen}><h2>Live Updates</h2><div id="monitor-log">${newEntries}${closeTag}`,
+    (_, cardOpen, _logOpen, _old, closeTag) =>
+      `${cardOpen}><h2>Live Updates ${checkedSpan}</h2><div id="monitor-log">${newEntries}${closeTag}`,
   );
 }
 
@@ -114,7 +116,23 @@ function buildDiffedRecs(oldSections, newSections) {
   return { html: parts.join(''), added, removed };
 }
 
+// ── --no-changes: just update last-checked timestamp and show card ───────────
+
+if (noChanges) {
+  const liveHtml = fs.readFileSync(livePath, 'utf8');
+  const checkedSpan = `<span id="monitor-last-checked" style="font-size:.8rem;font-weight:400;color:#6b7280">— checked ${timeStr}</span>`;
+  let updated = liveHtml
+    .replace(/<span id="monitor-last-checked"[^>]*>[^<]*<\/span>/, checkedSpan)
+    .replace(/(<div class="card" id="monitoring")[^>]*>/, '$1>');
+  fs.writeFileSync(livePath, updated, 'utf8');
+  console.log(JSON.stringify({ success: true, time: timeStr, noChanges: true }));
+  process.exit(0);
+}
+
 // ── Build new monitor-log entry ──────────────────────────────────────────────
+
+const liveHtml = fs.readFileSync(livePath, 'utf8');
+const draftHtml = fs.readFileSync(draftPath, 'utf8');
 
 const changes = changesRaw ? JSON.parse(changesRaw) : [];
 const changeHtml = changes.length > 0
@@ -158,16 +176,13 @@ if (oldSecs.length > 0 && newSecs.length > 0) {
 
 let merged = draftHtml;
 
-// Replace metrics and team sections (draft already has fresh data, just keep them)
-// They're already correct in the draft — nothing to do.
-
-// Replace recs-content with diffed version
+// Replace recs-content with diffed version (preserves live recs when draft has placeholder)
 if (mergedRecsInner) {
   merged = replaceRecsInner(merged, mergedRecsInner);
 }
 
-// Replace monitoring card with preserved + new entries, visible
-merged = replaceMonitorCard(merged, allEntries);
+// Replace monitoring card with preserved + new entries, visible, last-checked updated
+merged = replaceMonitorCard(merged, allEntries, timeStr);
 
 fs.writeFileSync(livePath, merged, 'utf8');
 

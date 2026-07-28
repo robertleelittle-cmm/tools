@@ -607,10 +607,10 @@ console.log = (...args) => { _origLog(...args); };
       '<div class="chart-wrap">' + svg + '</div></div>\n<!-- /SEC:metrics -->\n' +
       '<!-- SEC:team -->\n<div class="card" id="team-status"><h2>Team Status</h2>' + teamHtml + '</div>\n<!-- /SEC:team -->\n' +
       '<div class="card" id="recommendations"><h2>Recommendations</h2><div id="recs-content"><!-- RECOMMENDATIONS_PLACEHOLDER --></div></div>\n' +
-      '<div class="card" id="monitoring" style="display:none"><h2>Live Updates</h2><div id="monitor-log"><!-- MONITORING_LOG_PLACEHOLDER --></div></div>\n' +
       '<div class="card"><h2>Availability and Upcoming Events</h2>' + avHtml + '</div>\n' +
+      '<div class="card" id="monitoring" style="display:none"><h2>Live Updates <span id="monitor-last-checked" style="font-size:.8rem;font-weight:400;color:#6b7280"></span></h2><div id="monitor-log"><!-- MONITORING_LOG_PLACEHOLDER --></div></div>\n' +
       '</div>\n<div id="wip-tip"></div>\n<script>' + js + '<\/script>\n' +
-      '<script>(function(){var _ids=[\'monitor-log\',\'kanban-metrics\',\'team-status\',\'recs-content\'];var _kn={};_ids.forEach(function(id){var el=document.getElementById(id);_kn[id]=el?el.innerHTML:\'\';});setInterval(function(){var xhr=new XMLHttpRequest();xhr.open(\'GET\',location.href,true);xhr.onload=function(){try{var doc=new DOMParser().parseFromString(xhr.responseText,\'text/html\');_ids.forEach(function(id){var nel=doc.getElementById(id);var oel=document.getElementById(id);if(nel&&oel&&nel.innerHTML!==_kn[id]){_kn[id]=nel.innerHTML;oel.innerHTML=nel.innerHTML;if(id===\'monitor-log\'){var mc=document.getElementById(\'monitoring\');if(mc)mc.style.display=\'\';}}})}catch(e){}};xhr.send();},15000);})();<\/script>\n' +
+      '<script>(function(){var _ids=[\'monitor-log\',\'kanban-metrics\',\'team-status\',\'recs-content\',\'monitor-last-checked\'];var _kn={};_ids.forEach(function(id){var el=document.getElementById(id);_kn[id]=el?el.innerHTML:\'\';});setInterval(function(){var xhr=new XMLHttpRequest();xhr.open(\'GET\',location.href,true);xhr.onload=function(){try{var doc=new DOMParser().parseFromString(xhr.responseText,\'text/html\');_ids.forEach(function(id){var nel=doc.getElementById(id);var oel=document.getElementById(id);if(nel&&oel&&nel.innerHTML!==_kn[id]){_kn[id]=nel.innerHTML;oel.innerHTML=nel.innerHTML;if(id===\'monitor-log\'||id===\'monitor-last-checked\'){var mc=document.getElementById(\'monitoring\');if(mc)mc.style.display=\'\';}}})}catch(e){}};xhr.send();},15000);})();<\/script>\n' +
       '</body>\n</html>';
   }
 

@@ -108,9 +108,10 @@ After injecting recommendations, use AskUserQuestion with:
    gh pr list --repo covermymeds/drugs-api --state merged --search "PARCH-NNN" --json number,title,mergedAt,author --limit 3 2>/dev/null
    ```
    If any PR has a `mergedAt` timestamp within the last 2 hours **and the key `PARCH-NNN#NUMBER` is not already in `knownMergedPRs` in the state file**, collect it as an extra change: `"PARCH-NNN: PR #NNN merged by AUTHOR — card still In Review, needs transition to Done"`. After surfacing a merged PR, add its key (`PARCH-NNN#NUMBER`) to `knownMergedPRs` in the state file so it is not reported again. If any new merged PRs are found, treat the run as "different" and include these entries in the changes array for step 6a (even if the Jira Team Status text is identical).
-5. **If identical to `snapshotTeamStatus` AND no merged PRs found in step 4.5:** prepend to the monitoring log in the HTML:
-   ```html
-   <div class="monitor-entry"><span class="monitor-time">HH:MM</span> — <span class="monitor-nochange">No changes.</span></div>
+5. **If identical to `snapshotTeamStatus` AND no merged PRs found in step 4.5:** update the last-checked timestamp only (no log entry):
+   ```
+   node /Users/robert.little/.claude/skills/owen/.claude/scripts/update-live-standup.js \
+     --live <htmlPath> --time <HH:MM> --no-changes
    ```
    Report "No changes at HH:MM." and stop.
 6. **If different (Team Status changed OR merged PRs found in step 4.5):**
