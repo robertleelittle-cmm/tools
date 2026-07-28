@@ -132,16 +132,24 @@ async function fetchRemoteLinks(issueKey, issueId) {
       if (u && prPattern.test(u)) urls.add(u);
     }
   } catch { /* ignore */ }
-  // Also check Jira's development-panel integration (GitHub app / smart commits)
+  // Also check Jira's development-panel integration (GitHub app / smart commits).
+  // Must discover instance type keys via the summary first — the applicationType
+  // value varies by integration (e.g. "oAuth-com.github.integration.production").
   if (issueId) {
     try {
-      const devInfo = await jiraGet(
-        `/rest/dev-status/1.0/issue/detail?issueId=${issueId}&applicationType=GitHub&dataType=pullrequest`
-      );
-      for (const detail of (devInfo?.detail ?? [])) {
-        for (const pr of (detail.pullRequests ?? [])) {
-          if (pr.url && prPattern.test(pr.url)) urls.add(pr.url);
-        }
+      const summary = await jiraGet(`/rest/dev-status/1.0/issue/summary?issueId=${issueId}`);
+      const instanceTypes = Object.keys(summary?.summary?.pullrequest?.byInstanceType ?? {});
+      for (const appType of instanceTypes) {
+        try {
+          const devInfo = await jiraGet(
+            `/rest/dev-status/1.0/issue/detail?issueId=${issueId}&applicationType=${encodeURIComponent(appType)}&dataType=pullrequest`
+          );
+          for (const detail of (devInfo?.detail ?? [])) {
+            for (const pr of (detail.pullRequests ?? [])) {
+              if (pr.url && prPattern.test(pr.url)) urls.add(pr.url);
+            }
+          }
+        } catch { /* ignore */ }
       }
     } catch { /* ignore */ }
   }
