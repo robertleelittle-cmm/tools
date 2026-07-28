@@ -122,15 +122,30 @@ async function searchAll(jql, fields, expand = null) {
   return issues;
 }
 
-async function fetchRemoteLinks(issueKey) {
+async function fetchRemoteLinks(issueKey, issueId) {
+  const prPattern = /github\.com\/[^/]+\/[^/]+\/pull\/\d+/;
+  const urls = new Set();
   try {
     const links = await jiraGet(`/rest/api/3/issue/${issueKey}/remotelink`);
-    return (Array.isArray(links) ? links : [])
-      .map(l => l.object?.url)
-      .filter(url => url && /github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(url));
-  } catch {
-    return [];
+    for (const l of (Array.isArray(links) ? links : [])) {
+      const u = l.object?.url;
+      if (u && prPattern.test(u)) urls.add(u);
+    }
+  } catch { /* ignore */ }
+  // Also check Jira's development-panel integration (GitHub app / smart commits)
+  if (issueId) {
+    try {
+      const devInfo = await jiraGet(
+        `/rest/dev-status/1.0/issue/detail?issueId=${issueId}&applicationType=GitHub&dataType=pullrequest`
+      );
+      for (const detail of (devInfo?.detail ?? [])) {
+        for (const pr of (detail.pullRequests ?? [])) {
+          if (pr.url && prPattern.test(pr.url)) urls.add(pr.url);
+        }
+      }
+    } catch { /* ignore */ }
   }
+  return [...urls];
 }
 
 async function fetchPrActivity(prUrl) {
@@ -343,6 +358,7 @@ console.log = (...args) => { _origLog(...args); };
     return {
       name: issue.fields.assignee?.displayName ?? '(unassigned)',
       key: issue.key,
+      id: issue.id,
       summary: issue.fields.summary,
       status: issue.fields.status.name,
       ms,
@@ -360,7 +376,7 @@ console.log = (...args) => { _origLog(...args); };
     const reviewRows = rows.filter(r => /review/i.test(r.status));
     if (reviewRows.length) {
       const linkResults = await Promise.all(
-        reviewRows.map(r => fetchRemoteLinks(r.key).then(urls => ({ key: r.key, urls })))
+        reviewRows.map(r => fetchRemoteLinks(r.key, r.id).then(urls => ({ key: r.key, urls })))
       );
       await Promise.all(linkResults.map(async ({ key, urls }) => {
         const row = rows.find(r => r.key === key);
