@@ -14,6 +14,7 @@ Each slash command is a `.md` file in `.claude/commands/`. Commands that need da
 .claude/
   commands/       # one .md file per slash command
   scripts/        # one .js file per script-backed commands
+  assets/         # static assets a command depends on (e.g. the Marp theme)
   standup-context.json   # gitignored; managed by Claude, not edited manually
 ```
 
@@ -99,3 +100,25 @@ Produces canonical meta-documents: reference documents that define what must be 
 - **Project templates** (optional): project-facing starters teams clone into their folio. Pre-populated with required sections and guidance notes; back-reference the meta-doc as the compliance standard.
 
 **Workflow:** Interactive interview → markdown draft for review → optional subordinate/template drafts → optional Confluence publish.
+
+## /mdslides
+
+Authors or validates a CoverMyMeds-branded slide deck as plain, diff-friendly markdown. The `.md` stays minimal (front-matter + headings + content + the occasional per-slide class); all brand styling lives in the theme CSS, so the source parses cleanly for AI and diffs like any code file.
+
+**Usage:** `/mdslides <new|validate|preview|export> [file|name] [args]`
+
+**Requires:** `node` + `npx` (marp-cli is fetched on first run, no global install). A Chrome/Chromium/Edge browser for the live `--preview` window and PPTX/PNG export; HTML export needs no browser.
+
+**Verbs:**
+- `new [name]` — interview or ingest content, then write a branded `<name>.md` that follows the markdown contract; validates before handing back
+- `validate <file>` — lint for valid + minimal Marp and brand-theme compliance; reports a ✅/⚠️/❌ table + verdict, does not silently rewrite
+- `preview <file>` — open the live-reloading preview window (`--preview --watch`); falls back to HTML export if no browser
+- `export <file> [pptx|html]` — write a shareable file next to the source and open it
+
+**Config:** `.claude/assets/marp/marp.config.js` -- passed to marp-cli with `-c`. Registers the brand theme, enables the column engine, and sets `html`/`allowLocalFiles`, so a deck reproduces identically outside the skill (`npx @marp-team/marp-cli deck.md -c .claude/assets/marp/marp.config.js --no-stdin -o deck.html`) with no repo dependencies to install. Always pass `--no-stdin` (marp-cli v4 hangs on a piped stdin otherwise).
+
+**Theme:** `.claude/assets/marp/covermymeds.css` -- self-contained, built from the authoritative `CoverMyMeds_PowerPointTemplate_2026.potx` ("CMM Master"): Georgia headings / Arial body, the CMM palette, corner wordmark and ring frame embedded as data URIs. Regenerate with `.claude/assets/marp/gen_theme.py` if the brand marks change.
+
+**Devices:** per-slide classes `title` / `section` / `lead` / `invert`; native `header:`/`footer:` directives for the eyebrow and confidentiality line; and columns via markdown-neutral HTML-comment markers (`<!-- columns -->`, `<!-- col orange|magenta|blue|navy -->`, `<!-- /columns -->`) that the config engine expands into the theme's colored card panels at render time -- no `<div>` or `html: true` in the source, so decks stay formatter-safe. `.claude/assets/marp/example.md` exercises every device.
+
+**Render-instructions header:** every deck carries a one-line HTML comment right after the front-matter -- `<!-- Render this like PowerPoint slides!  ->  https://covermymeds.atlassian.net/wiki/x/DQAT9g -->` -- pointing to the Confluence how-to page ("Rendering CoverMyMeds Marp Slide Decks") that carries the full render + authoring instructions. It renders to nothing on the slides. Update the page, not each deck.

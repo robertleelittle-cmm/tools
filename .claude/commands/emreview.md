@@ -1,7 +1,8 @@
 <!-- EM review: SOX/ITGC compliance gate -- the final human sign-off before a change goes to production.
      This is NOT a code review. It checks process, traceability, segregation of duties, and testing evidence.
      Usage: /emreview <PR number or URL>
-     Default repo: covermymeds/drugs-api. Override with full URL or "owner/repo#number". -->
+     Default repo: covermymeds/drugs-api. Override with full URL or "owner/repo#number".
+     Version: 1.3 -->
 
 ## What an EM review is
 
@@ -35,10 +36,15 @@ gh api repos/<OWNER>/<REPO>/contents/.github/CODEOWNERS --jq '.content' | base64
   || gh api repos/<OWNER>/<REPO>/contents/CODEOWNERS --jq '.content' | base64 -d
 ```
 
+Also scan the PR description for an **EM review checklist**: a block of markdown checkboxes (`- [ ]`/`- [x]`) under a heading or label that explicitly targets the EM (e.g. "EM Review", "EM Checklist", "For EM", "EM sign-off"). If found, extract each item and its checked/unchecked state. If no such block exists, note its absence — criterion 8 is simply omitted from the report.
+
 Extract any Jira ticket key(s) from the PR description. Match any `[A-Z]+-[0-9]+` pattern or Jira URL. Fetch each with the Atlassian Rovo MCP:
 - Tool: `getJiraIssue`, `cloudId`: `covermymeds.atlassian.net`
 - `fields`: `["summary", "description", "status", "assignee", "comment"]`
 - `responseContentFormat`: `"markdown"`
+
+Also fetch issue links for each Jira ticket to check for open blockers or dependencies:
+- Tool: `getJiraIssueRemoteIssueLinks` is not sufficient — use `getJiraIssue` with `fields: ["issuelinks"]` in a second call, or include `"issuelinks"` in the fields list above. Look for any link where the relationship type is "is blocked by", "depends on", or equivalent, and the linked issue is not in a Done/Resolved/Closed status. If found, surface it in criterion 7.
 
 **Determine review flow** — two distinct paths, same 7 criteria, satisfied differently:
 
@@ -109,13 +115,26 @@ STCM flow:
 
 ---
 
-**5. Testing evidence valid** — Evidence demonstrates the specific change worked.
-- Evidence present (log output, screenshots, CI results)?
-  - Standard flow: evidence is in the PR description.
-  - STCM flow: evidence may be in the STCM ticket instead of the PR — check both.
-- Evidence shows the specific behavior described in the change (not just "app starts")?
-- For low-risk changes, CI green is sufficient. For medium/high, prefer screenshots or live-environment log output — note if CI-only evidence is present for a non-low-risk change.
-- Do NOT compare screenshot or manual-test timestamps to commit timestamps. Test environments are deployed and tested independently, and evidence is typically captured before the final commit push. Timestamps on screenshots are irrelevant — only content matters.
+**5. Testing evidence valid** — Evidence exists that the change was exercised and the acceptance criteria are met.
+
+Three modes, assessed differently:
+
+**CI-backed automated tests** (GitHub Actions or equivalent): No output in the PR is required — CI ran the suite and results are auditable there. The question is solely whether test coverage exists for the acceptance criteria. Coverage can be new tests added in this PR, or pre-existing tests that already cover the changed behavior (e.g., a library swap where existing unit tests exercise the same functionality). A bare pass count with no indication of AC coverage is thin — note it. A commit or diff showing new or existing tests that map to the AC is sufficient.
+
+**Manual or exploratory verification**: When the change cannot be fully verified by automated tests (UI behavior, external integrations, deployment steps, DB operations), a screenshot or log excerpt must appear in the PR body or comments showing the changed behavior worked.
+
+- Standard flow: look in the PR description and comments.
+- STCM flow: look in the STCM ticket as well — evidence may live there instead.
+- Do NOT compare screenshot or manual-test timestamps to commit timestamps. Test environments are deployed independently, and evidence is typically captured before the final commit push. Timestamps on screenshots are irrelevant — only content matters.
+
+**Lower-environment prerequisite PR (merge-then-verify)**: Some repos use a workflow where a change must be deployed to a lower environment (e.g., unstable) before testing evidence can be captured — merging this PR IS the deployment step, so pre-merge evidence is structurally impossible. This applies when **both** of the following are true:
+
+1. The testing evidence comment or PR description explicitly states this PR is a lower-environment or non-production-facing step (e.g., "unstable only", "not production facing", "to gather testing evidence for the stable PR", or equivalent language).
+2. The production promotion that follows will go through its own separate EM review (with an STCM or its own PR review), at which point the testing evidence from this merged change will be required before that review can pass.
+
+In this case, criterion 5 **passes** — the merge-then-verify pattern is the established process for this repo, and the explicit acknowledgment in the testing evidence comment is sufficient. Note in the output that post-merge verification (e.g., ArgoCD green) is expected before the stable or production PR can advance.
+
+Currently known repos that use this pattern: `infrastructure/sharedtech-k8s`. Others may be added over time.
 
 ---
 
@@ -134,11 +153,32 @@ STCM flow:
 
 ---
 
-**7. Production intent confirmed** — PR is not a draft; no WIP/DO-NOT-MERGE markers.
-- PR not in draft state?
-- Title/description free of "WIP", "DO NOT MERGE", "draft"?
+**7. Production intent confirmed** — No affirmative signals indicate this change should be held.
+
+The default assumption is that the change is ready to deploy. This criterion only fails or needs info if something explicitly signals a hold. Scan the PR description, PR comments, and the linked Jira ticket for:
+
+- A deployment timing constraint ("deploy after hours", "coordinate with X team", "maintenance window required")
+- An unmet prerequisite ("blocked by PARCH-nnn", "waiting on config change in Y repo")
+- A stakeholder sign-off still pending ("needs product approval before shipping")
+- An open blocker or dependency link on the Jira ticket (a linked issue in Blocked By or Depends On status that is not yet resolved)
+
+If any of these are present: ⚠️ NEEDS INFO — surface what was found and let the EM decide.
+If none are found: ✅ PASS — note "no hold indicators found."
+
+Do not flag the absence of a deployment note as a problem. Absence of a hold signal is itself the signal.
 
 *(Same for both flows.)*
+
+---
+
+**8. PR-specific requirements** *(only if an EM review checklist was found in the PR description)*
+
+These are loose, PR-author-defined checks -- not SOX criteria -- but they were explicitly surfaced for the EM, so all must be satisfied before approval.
+- A checklist item marked `[x]` is satisfied.
+- A checklist item marked `[ ]` is not. List unchecked items verbatim in the Notes column.
+- PASS if every item is checked.
+- ⚠️ NEEDS INFO if some items are unchecked.
+- If no EM review checklist was present in the PR, **omit this row entirely** from the table.
 
 ---
 
@@ -153,7 +193,7 @@ After assessing the 7 criteria, check whether all required CODEOWNERS approvals 
 ### Part D: Verdict
 
 One of three:
-- **APPROVED** — all 7 criteria pass
+- **APPROVED** — all applicable criteria pass (criteria 1–7 always; criterion 8 when present)
 - **NOT APPROVED** — one or more FAIL
 - **PENDING** — one or more NEEDS INFO, no FAILs
 
@@ -178,11 +218,14 @@ Produce this as a single markdown block, ready to paste as a GitHub PR comment:
 | 5 | Testing evidence valid | ✅/❌/⚠️ | |
 | 6 | Change history intact | ✅/❌/⚠️ | |
 | 7 | Production intent confirmed | ✅/❌/⚠️ | |
+| 8 | PR-specific requirements | ✅/❌/⚠️ | |
 
 **Verdict: APPROVED / NOT APPROVED / PENDING**
 ```
 
-Fill in the Notes column only for non-passing items — one clause is enough ("no ticket linked", "author approved own PR", "evidence predates last commit by 3 days"). Leave Notes blank for passing items to keep the table readable.
+Row 8 is included only when an EM review checklist was present in the PR description; omit it entirely otherwise.
+
+Fill in the Notes column for every row — one short clause stating what was found ("PARCH-824, In Review, done-when met", "ivan-tactukmercado-cmm approved", "last commit 18:35 UTC, approval 20:28 UTC"). For non-passing items, the note must name the specific gap. For passing items, the note is the evidence that earned the pass. Never leave Notes blank.
 
 If NOT APPROVED or PENDING, add a brief "**To reach approval:**" bullet list naming exactly what must change.
 
@@ -192,3 +235,19 @@ If APPROVED and the STCM is pending manager/EM approval, replace that line with:
 
 If APPROVED but CODEOWNERS-required approvals are still pending, add instead:
 "⚠️ SOX criteria met, but the following required CODEOWNERS approvals are still outstanding — PR is not mergeable until these are in: `<owner/team>` (for `<path pattern>`)"
+
+After all verdict text, always append a **Links** section listing every relevant URL gathered during the review. Include all of the following that are present:
+
+```
+---
+**Links**
+- [PR #<number> — <title>](<PR URL>)
+- [<TICKET-KEY> — <summary>](<Jira URL>)   ← work ticket (standard flow) or STCM (STCM flow); repeat for each ticket found
+- [STCM-<number> — <summary>](<Jira URL>)  ← if STCM flow; omit if same as above
+```
+
+Rules:
+- Always include the PR being reviewed.
+- Include every Jira ticket key extracted from the PR description (work tickets, STCM tickets, any other `[A-Z]+-[0-9]+` references).
+- Use the ticket summary as the link label (fetch it from Jira if not already retrieved).
+- Omit any URL you could not resolve. Do not fabricate URLs.
