@@ -23,7 +23,7 @@ const ctx = (() => {
 // Then checks issue type, built-in summary patterns, and ctx.noPrKeywords.
 // Ambiguous tickets that pass through here are handled by classifyNoPrTickets (AI fallback).
 function looksLikeNoPr(row) {
-  if (/pull\s+request|merge\s+request/i.test(row.descriptionText || '')) return false;
+  if (/pull\s+request|merge\s+request|\bDB\s+PR\b|open\s+a\s+(PR|pull)\b|submit\s+a\s+(DB\s+)?PR\b/i.test(row.descriptionText || '')) return false;
   const noPrTypeSet = new Set(
     ctx.noPrTypes !== undefined
       ? ctx.noPrTypes
@@ -31,7 +31,7 @@ function looksLikeNoPr(row) {
   );
   if (row.issueType && noPrTypeSet.has(row.issueType)) return true;
   const s = row.summary || '';
-  const builtIn = [/\bKD:/i, /\bARB\b/i, /\bapi\s+key\b/i, /\baccess\s+to\s+/i];
+  const builtIn = [/\bKD:/i, /\bARB\b/i, /\baccess\s+to\s+/i];
   if (builtIn.some(re => re.test(s))) return true;
   if (ctx.noPrKeywords?.some(kw => s.toLowerCase().includes(kw.toLowerCase()))) return true;
   return false;
