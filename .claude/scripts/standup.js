@@ -626,7 +626,9 @@ console.log = (...args) => { _origLog(...args); };
         const days = Math.floor(r.ms / 86400000);
         const over = days > sleDays;
         let prHtml = '';
-        if (r.prSearched) {
+        if (!r.prSearched && looksLikeNoPr(r)) {
+          prHtml = '<span class="pr-info pr-not-needed">no pr needed</span>';
+        } else if (r.prSearched) {
           if (!r.prActivity) {
             prHtml = (looksLikeNoPr(r) || r.aiNoPr)
               ? '<span class="pr-info pr-not-needed">no pr needed</span>'
@@ -784,7 +786,9 @@ console.log = (...args) => { _origLog(...args); };
     for (const r of cards) {
       const link = `[${r.key}](${BASE}/browse/${r.key})`;
       console.log(`- ${link} ${trunc(r.summary, 60)} · **${r.status}** · ${r.ct}`);
-      if (r.prSearched) {
+      if (!r.prSearched && looksLikeNoPr(r)) {
+        console.log(`  - no PR needed`);
+      } else if (r.prSearched) {
         if (!r.prActivity) {
           console.log((looksLikeNoPr(r) || r.aiNoPr) ? `  - no PR needed` : `  - GitHub: no linked PR found`);
         } else {
