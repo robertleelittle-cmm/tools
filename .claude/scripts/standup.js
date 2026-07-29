@@ -723,7 +723,7 @@ console.log = (...args) => { _origLog(...args); };
       console.log(`- ${link} ${trunc(r.summary, 60)} · **${r.status}** · ${r.ct}`);
       if (r.prSearched) {
         if (!r.prActivity) {
-          console.log(`  - GitHub: no linked PR found`);
+          console.log(looksLikeNoPr(r) ? `  - no PR needed` : `  - GitHub: no linked PR found`);
         } else {
           const a = r.prActivity;
           const lastAgo = a.lastActivity ? humanDuration(NOW - a.lastActivity.getTime()) + ' ago' : 'unknown';
