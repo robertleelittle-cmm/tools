@@ -895,11 +895,32 @@ console.log = (...args) => { _origLog(...args); };
     );
     console.log('HTML_OUT:' + _sOut);
     if (!draftMode) {
-      const { execSync: _execSync } = require('child_process');
-      try {
-        const _opener = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start ""' : 'xdg-open';
-        _execSync(`${_opener} "${_sOut}"`);
-      } catch {}
+      const { execSync: _execSync, spawn: _spawn } = require('child_process');
+      const _path = require('path');
+      const _port = 8765;
+      const _tmpDir = _path.dirname(_sOut);
+      const _fileName = _path.basename(_sOut);
+      const _url = `http://localhost:${_port}/${_fileName}`;
+      const _opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
+
+      let _srvRunning = false;
+      try { _execSync(`lsof -ti:${_port}`, { stdio: 'pipe' }); _srvRunning = true; } catch {}
+
+      if (!_srvRunning) {
+        const _srv = _spawn('python3', ['-m', 'http.server', String(_port), '--bind', '127.0.0.1', '--directory', _tmpDir], {
+          detached: true, stdio: 'ignore',
+        });
+        _srv.unref();
+        // Auto-kill after 1 hour
+        const _killer = _spawn('bash', ['-c', `sleep 3600 && kill ${_srv.pid} 2>/dev/null`], {
+          detached: true, stdio: 'ignore',
+        });
+        _killer.unref();
+        // Give server a moment to start before opening browser
+        _execSync(`bash -c 'sleep 0.6 && ${_opener} "${_url}"' &`);
+      } else {
+        try { _execSync(`${_opener} "${_url}"`); } catch {}
+      }
     }
   }
 
