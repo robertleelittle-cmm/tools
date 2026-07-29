@@ -48,7 +48,7 @@ Format recommendations as markdown. Use headers, bold text, and bullet lists -- 
 
 After generating recommendations, identify the output path from the `HTML_OUT:` line in stdout, then use the Edit tool on that file to replace `<!-- RECOMMENDATIONS_PLACEHOLDER -->` with the recommendations formatted as HTML. Use `<h3>` for section headers, `<p>` for paragraphs, `<ul>`/`<li>` for lists, `<strong>` for bold, and `<a href="...">` for ticket links. Do not include the outer `<h2>Recommendations</h2>` heading -- that is already in the file.
 
-Finally, open `standup.html` in the browser by running: `open standup.html`
+Finally, open the HTML file in the browser using the path from the `HTML_OUT:` line: `open <HTML_OUT path>`
 
 ---
 
