@@ -18,6 +18,22 @@ const ctx = (() => {
   try { return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : {}; } catch { return {}; }
 })();
 
+// Returns true when an In Review ticket with no linked PR is non-code work.
+// Checks issue type first, then built-in summary patterns, then ctx.noPrKeywords.
+function looksLikeNoPr(row) {
+  const noPrTypeSet = new Set(
+    ctx.noPrTypes !== undefined
+      ? ctx.noPrTypes
+      : ['Task', 'Sub-task', 'Question', 'Documentation', 'Knowledge Article', 'Request', 'Process', 'Service Request']
+  );
+  if (row.issueType && noPrTypeSet.has(row.issueType)) return true;
+  const s = row.summary || '';
+  const builtIn = [/\bKD:/i, /\bARB\b/i, /\bapi\s+key\b/i, /\baccess\s+to\s+/i];
+  if (builtIn.some(re => re.test(s))) return true;
+  if (ctx.noPrKeywords?.some(kw => s.toLowerCase().includes(kw.toLowerCase()))) return true;
+  return false;
+}
+
 const BASE = (process.env.JIRA_BASE_URL || '').replace(/\/$/, '');
 const EMAIL = process.env.JIRA_EMAIL;
 const TOKEN = process.env.JIRA_API_TOKEN;
@@ -398,20 +414,9 @@ console.log = (...args) => { _origLog(...args); };
   rows = rows.filter(r => !isExcluded(r.name));
   for (const name of [...team.keys()]) if (isExcluded(name)) team.delete(name);
 
-  // Tag In Review rows that don't need a PR based on issue type.
-  // Override the default list by setting "noPrTypes" in standup-context.json.
-  const noPrTypeSet = new Set(
-    ctx.noPrTypes !== undefined
-      ? ctx.noPrTypes
-      : ['Task', 'Sub-task', 'Question', 'Documentation', 'Knowledge Article', 'Request', 'Process', 'Service Request']
-  );
-  for (const r of rows) {
-    if (/review/i.test(r.status) && r.issueType && noPrTypeSet.has(r.issueType)) r.noPrNeeded = true;
-  }
-
   // Enrich In Review cards with GitHub PR activity (linked via Jira remote links)
   if (!skipGithub) {
-    const reviewRows = rows.filter(r => /review/i.test(r.status) && !r.noPrNeeded);
+    const reviewRows = rows.filter(r => /review/i.test(r.status));
     if (reviewRows.length) {
       const linkResults = await Promise.all(
         reviewRows.map(r => fetchRemoteLinks(r.key, r.id).then(urls => ({ key: r.key, urls })))
@@ -558,11 +563,11 @@ console.log = (...args) => { _origLog(...args); };
         const days = Math.floor(r.ms / 86400000);
         const over = days > sleDays;
         let prHtml = '';
-        if (r.noPrNeeded) {
-          prHtml = '<span class="pr-info pr-not-needed">no pr needed</span>';
-        } else if (r.prSearched) {
+        if (r.prSearched) {
           if (!r.prActivity) {
-            prHtml = '<span class="pr-info pr-missing">no linked PR</span>';
+            prHtml = looksLikeNoPr(r)
+              ? '<span class="pr-info pr-not-needed">no pr needed</span>'
+              : '<span class="pr-info pr-missing">no linked PR</span>';
           } else {
             const a = r.prActivity;
             const lastAgo = a.lastActivity ? humanDuration(NOW - a.lastActivity.getTime()) + ' ago' : '?';
