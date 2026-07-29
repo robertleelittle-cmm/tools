@@ -21,8 +21,9 @@ const ctx = (() => {
 // Returns true when an In Review ticket with no linked PR is non-code work.
 // Description is checked first: any mention of a PR/pull request overrides classification.
 // Then checks issue type, built-in summary patterns, and ctx.noPrKeywords.
+// Ambiguous tickets that pass through here are handled by classifyNoPrTickets (AI fallback).
 function looksLikeNoPr(row) {
-  if (/\bpr\b|pull\s+request|merge\s+request/i.test(row.descriptionText || '')) return false;
+  if (/pull\s+request|merge\s+request/i.test(row.descriptionText || '')) return false;
   const noPrTypeSet = new Set(
     ctx.noPrTypes !== undefined
       ? ctx.noPrTypes
@@ -30,10 +31,67 @@ function looksLikeNoPr(row) {
   );
   if (row.issueType && noPrTypeSet.has(row.issueType)) return true;
   const s = row.summary || '';
-  const builtIn = [/\bKD:/i, /\bARB\b/i, /\baccess\s+to\s+/i];
+  const builtIn = [/\bKD:/i, /\bARB\b/i, /\bapi\s+key\b/i, /\baccess\s+to\s+/i];
   if (builtIn.some(re => re.test(s))) return true;
   if (ctx.noPrKeywords?.some(kw => s.toLowerCase().includes(kw.toLowerCase()))) return true;
   return false;
+}
+
+// Calls Claude Haiku to classify In-Review tickets that slipped past looksLikeNoPr.
+// Sets row.aiNoPr = true for those that don't need a code PR.
+async function classifyNoPrTickets(rows) {
+  if (!process.env.ANTHROPIC_API_KEY) return;
+  const ambiguous = rows.filter(r => r.prSearched && !r.prActivity && !looksLikeNoPr(r));
+  if (!ambiguous.length) return;
+
+  function adfToText(adfJson) {
+    try {
+      const walk = n => !n ? '' : n.text ? n.text : (n.content || []).map(walk).join(' ');
+      return walk(JSON.parse(adfJson)).replace(/\s+/g, ' ').trim().slice(0, 500);
+    } catch { return ''; }
+  }
+
+  const ticketList = ambiguous.map(r => {
+    const desc = adfToText(r.descriptionText);
+    return `${r.key} [${r.issueType}]: ${r.summary}\nDescription: ${desc}`;
+  }).join('\n\n---\n\n');
+
+  const prompt = `Classify each Jira ticket: does it require a GitHub code pull request ("needs_pr"), or is it non-code work ("no_pr_needed")?
+
+Non-code: compliance assessments (OneTrust, AIA, GRC), ServiceNow/platform team requests, access requests, documentation, knowledge articles, API key provisioning where the team requests a key from another team, and similar administrative or process work.
+
+Code (needs PR): implementing features, fixing bugs, changing codebase files (package.json, configs, CI, source code), removing/adding dependencies, updating docs that live in the repo itself, etc.
+
+Tickets to classify:
+${ticketList}
+
+Reply with ONLY a JSON object. Example: {"PARCH-123":"no_pr_needed","PARCH-456":"needs_pr"}`;
+
+  try {
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 256,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const text = data.content?.[0]?.text || '';
+    const m = text.match(/\{[\s\S]*\}/);
+    if (!m) return;
+    const result = JSON.parse(m[0]);
+    for (const row of ambiguous) {
+      if (result[row.key] === 'no_pr_needed') row.aiNoPr = true;
+    }
+  } catch { /* silent fallback */ }
 }
 
 const BASE = (process.env.JIRA_BASE_URL || '').replace(/\/$/, '');
@@ -435,6 +493,8 @@ console.log = (...args) => { _origLog(...args); };
     }
   }
 
+  await classifyNoPrTickets(rows);
+
   // ── National Days ───────────────────────────────────────────────────────────
   const nationalDays = await fetchNationalDays();
   const todayDate = new Date(NOW);
@@ -568,7 +628,7 @@ console.log = (...args) => { _origLog(...args); };
         let prHtml = '';
         if (r.prSearched) {
           if (!r.prActivity) {
-            prHtml = looksLikeNoPr(r)
+            prHtml = (looksLikeNoPr(r) || r.aiNoPr)
               ? '<span class="pr-info pr-not-needed">no pr needed</span>'
               : '<span class="pr-info pr-missing">no linked PR</span>';
           } else {
@@ -726,7 +786,7 @@ console.log = (...args) => { _origLog(...args); };
       console.log(`- ${link} ${trunc(r.summary, 60)} · **${r.status}** · ${r.ct}`);
       if (r.prSearched) {
         if (!r.prActivity) {
-          console.log(looksLikeNoPr(r) ? `  - no PR needed` : `  - GitHub: no linked PR found`);
+          console.log((looksLikeNoPr(r) || r.aiNoPr) ? `  - no PR needed` : `  - GitHub: no linked PR found`);
         } else {
           const a = r.prActivity;
           const lastAgo = a.lastActivity ? humanDuration(NOW - a.lastActivity.getTime()) + ' ago' : 'unknown';
