@@ -19,8 +19,10 @@ const ctx = (() => {
 })();
 
 // Returns true when an In Review ticket with no linked PR is non-code work.
-// Checks issue type first, then built-in summary patterns, then ctx.noPrKeywords.
+// Description is checked first: any mention of a PR/pull request overrides classification.
+// Then checks issue type, built-in summary patterns, and ctx.noPrKeywords.
 function looksLikeNoPr(row) {
+  if (/\bpr\b|pull\s+request|merge\s+request/i.test(row.descriptionText || '')) return false;
   const noPrTypeSet = new Set(
     ctx.noPrTypes !== undefined
       ? ctx.noPrTypes
@@ -28,7 +30,7 @@ function looksLikeNoPr(row) {
   );
   if (row.issueType && noPrTypeSet.has(row.issueType)) return true;
   const s = row.summary || '';
-  const builtIn = [/\bKD:/i, /\bARB\b/i, /\bapi\s+key\b/i, /\baccess\s+to\s+/i];
+  const builtIn = [/\bKD:/i, /\bARB\b/i, /\baccess\s+to\s+/i];
   if (builtIn.some(re => re.test(s))) return true;
   if (ctx.noPrKeywords?.some(kw => s.toLowerCase().includes(kw.toLowerCase()))) return true;
   return false;
@@ -283,7 +285,7 @@ console.log = (...args) => { _origLog(...args); };
     jiraGet('/rest/api/3/field'),
     searchAll(
       `project = ${PROJECT} AND ${ACTIVE_STATUS_JQL} AND issuetype != Epic`,
-      ['assignee', 'summary', 'status', 'statuscategorychangedate', STORY_POINTS_FIELD, 'issuetype'].join(','),
+      ['assignee', 'summary', 'status', 'statuscategorychangedate', STORY_POINTS_FIELD, 'issuetype', 'description'].join(','),
       'changelog',
     ),
     // 28-day completed set for both SLE calculation and team membership (14d subset)
@@ -404,6 +406,7 @@ console.log = (...args) => { _origLog(...args); };
       summary: issue.fields.summary,
       status: issue.fields.status.name,
       issueType: issue.fields.issuetype?.name ?? null,
+      descriptionText: issue.fields.description ? JSON.stringify(issue.fields.description) : '',
       ms,
       ct,
       collabs: collabsByKey.get(issue.key) ?? [],
