@@ -37,6 +37,42 @@ function looksLikeNoPr(row) {
   return false;
 }
 
+// Fetches OOO entries from the team M365 group calendar (GRP Dumpster Firefighters OOO).
+// Returns entries shaped like ctx.pto: { name, start, end, note }.
+// Fails silently if az CLI is unavailable or the session token is expired.
+async function fetchGroupOOO() {
+  const GROUP_ID = '5731e1d4-4127-47f1-a547-4043adae8792';
+  const from = new Date(NOW - 30 * 86400000).toISOString().slice(0, 10);
+  try {
+    const { execSync } = require('child_process');
+    const url = `https://graph.microsoft.com/v1.0/groups/${GROUP_ID}/calendar/events` +
+      `?$filter=end/dateTime ge '${from}T00:00:00Z'&$select=subject,start,end,isAllDay&$top=100&$orderby=start/dateTime`;
+    const out = execSync(`az rest --method GET --url ${JSON.stringify(url)} 2>/dev/null`, { encoding: 'utf8', timeout: 12000 });
+    const data = JSON.parse(out);
+    const entries = [];
+    for (const ev of (data.value || [])) {
+      const m = (ev.subject || '').match(/^([A-Za-z]+(?:\s+[A-Za-z]+)?)\s+OOO(?:\s*[-–]\s*(.+))?/i);
+      if (!m) continue;
+      const name = m[1].trim();
+      const note = m[2] ? m[2].trim() : null;
+      let startDate, endDate;
+      if (ev.isAllDay) {
+        startDate = ev.start.dateTime.slice(0, 10);
+        const endDt = new Date(ev.end.dateTime);
+        endDt.setUTCDate(endDt.getUTCDate() - 1);
+        endDate = endDt.toISOString().slice(0, 10);
+      } else {
+        startDate = ev.start.dateTime.slice(0, 10);
+        endDate = ev.end.dateTime.slice(0, 10);
+      }
+      entries.push({ name, start: startDate, end: endDate, note, source: 'calendar' });
+    }
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
 // Calls Claude Haiku to classify In-Review tickets that slipped past looksLikeNoPr.
 // Sets row.aiNoPr = true for those that don't need a code PR.
 async function classifyNoPrTickets(rows) {
@@ -494,6 +530,10 @@ console.log = (...args) => { _origLog(...args); };
   }
 
   await classifyNoPrTickets(rows);
+
+  // Merge live OOO entries from the team group calendar into ctx.pto
+  const calendarOOO = await fetchGroupOOO();
+  if (calendarOOO.length) ctx.pto = [...(ctx.pto || []), ...calendarOOO];
 
   // ── National Days ───────────────────────────────────────────────────────────
   const nationalDays = await fetchNationalDays();
