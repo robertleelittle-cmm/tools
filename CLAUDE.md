@@ -34,18 +34,24 @@ Set these in a `.env` file at the repo root (gitignored) or in your shell profil
 
 ## standup-context.json
 
-Gitignored. Managed entirely by Claude -- never edit manually. Structure:
+Gitignored. Managed entirely by Claude -- never edit manually (except `holidays`, which the script itself computes and caches). Structure:
 
 ```json
 {
   "defaultExclude": ["Name to always omit"],
   "pto": [
-    { "name": "Full Name", "start": "YYYY-MM-DD", "end": "YYYY-MM-DD", "note": "reason" }
-  ]
+    { "name": "Full Name", "start": "YYYY-MM-DD", "end": "YYYY-MM-DD", "note": "reason" },
+    { "name": "Full Name", "start": "YYYY-MM-DD", "end": "YYYY-MM-DD", "allDay": false, "startTime": "1:00 PM", "endTime": "5:00 PM" }
+  ],
+  "holidays": { "year": 2026, "dates": ["2026-01-01", "..."] }
 }
 ```
 
-Tell Claude in natural language to update it: "Rob is out next week", "remove Jeffrey from the ignore list", "Seyoung is back Thursday".
+Tell Claude in natural language to update it: "Rob is out next week", "remove Jeffrey from the ignore list", "Seyoung is back Thursday", "Dana's out this afternoon 1-5".
+
+PTO entries default to full-day. `allDay: false` + `startTime`/`endTime` marks a partial-day absence -- the engineer is only shown as out during that clock window, not flagged out (or excluded from backlog suggestions) for the whole day.
+
+`holidays` caches CMM's standard observed US holidays (New Year's, MLK Day, Memorial Day, Juneteenth, July 4th, Labor Day, Thanksgiving + the Friday after, Christmas), computed once when the year in the cache no longer matches the current year. Used to compute "next work day" (skips weekends and holidays) for PTO return dates and recommendation phrasing.
 
 ## /emreview
 
@@ -69,7 +75,7 @@ Runs a PARCH kanban standup report (default project). Override with `--project K
 - Multi-Ticket Owners and Collaborator Load sections (used by Claude for recommendations)
 - Writes `standup.md` to the working directory on every run
 
-**PTO handling:** active PTO suppresses backlog suggestions; upcoming PTO (within 7 days) is flagged on the engineer's line.
+**PTO handling:** active full-day PTO suppresses backlog suggestions; a partial-day absence (`allDay: false`) only suppresses them while the current time is inside its window. Upcoming PTO (within 7 days) is flagged on the engineer's line. "Returns" and "next work day" dates skip weekends and CMM holidays (see `holidays` in standup-context.json).
 
 ## /goalsetting
 

@@ -1,7 +1,10 @@
 <!-- PARCH standup flow report: team derived from current and recent ticket assignments, no hard-coded names.
      Persistent defaults are read from .claude/standup-context.json: "defaultExclude" lists engineers always
      omitted from the report, and "pto" lists date-ranged absences ({ name, start, end, note } in YYYY-MM-DD).
+     PTO/OOO entries default to full-day. Add "allDay": false plus "startTime"/"endTime" (e.g. "1:00 PM") for a
+     partial-day absence -- the person is only shown as out during that window, not the whole day.
      "events" lists upcoming events: { date: "YYYY-MM-DD", name: "...", note: "..." }.
+     "holidays" ({ year, dates }) is computed and cached by the script itself once per calendar year -- never edit manually.
      CLI: --exclude "Name1, Name2" or --ignore "Name1, Name2" adds to the default exclude list for this run.
           --project KEY overrides the default Jira project (default: PARCH).
           --skip-github skips GitHub PR activity fetching for In Review cards (faster, less data). -->
@@ -25,6 +28,8 @@ Once you have the stdout output:
 1. Display the **Computed SLE** and **Team Status** sections verbatim, without any modification or commentary.
 2. Then provide a prioritized list of actionable recommendations grounded in kanban flow principles, using the Multi-Ticket Owners and Collaborator Load sections as supporting data. Do not reprint those sections.
 
+The team doesn't work weekends, and CMM observes standard holidays. Whenever a recommendation names a day to pick something up ("ready to start tomorrow", "can review it first thing"), use the exact date from the **Next work day** line in stdout rather than computing your own "tomorrow" -- it already skips weekends and holidays.
+
 Write recommendations as a team facilitator, not a manager. These appear in standup where the whole team is present -- they are prompts for conversation, not instructions. Keep this in mind throughout:
 - Frame action items as questions: "Can X review Y today?" not "X needs to review Y"
 - Acknowledge data gaps openly before drawing conclusions: if the standup data is incomplete, say so
@@ -47,6 +52,12 @@ Recommendations must cover:
 Format recommendations as markdown. Use headers, bold text, and bullet lists -- no pipe tables. Every ticket reference must be a markdown link to its Jira card (https://covermymeds.atlassian.net/browse/ISSUE-nnn). Name engineers and tickets specifically, but frame actions as questions and suggestions, not orders. Prioritize by flow impact, not by age alone.
 
 After generating recommendations, identify the output path from the `HTML_OUT:` line in stdout, then use the Edit tool on that file to replace `<!-- RECOMMENDATIONS_PLACEHOLDER -->` with the recommendations formatted as HTML. Use `<h3>` for section headers, `<p>` for paragraphs, `<ul>`/`<li>` for lists, `<strong>` for bold, and `<a href="...">` for ticket links. Do not include the outer `<h2>Recommendations</h2>` heading -- that is already in the file.
+
+Every ticket link must carry the same hover-tooltip data attributes used elsewhere in the report, so hovering it shows the ticket summary: `<a href="https://covermymeds.atlassian.net/browse/TICKET-nnn" class="card-key tt" data-key="TICKET-nnn" data-title="TICKET-nnn" data-summary="SUMMARY" data-url="https://covermymeds.atlassian.net/browse/TICKET-nnn">TICKET-nnn</a>`, where `SUMMARY` is the ticket's summary text from the stdout data (HTML-escape it).
+
+If a recommendation mentions a specific PR, its link needs the matching set too -- don't drop this: `<a href="PR_URL" class="pr-link tt" data-key="pr-NUM" data-title="PR #NUM · REPO" data-summary="SUMMARY" data-meta="META" data-url="PR_URL" data-link-label="Open PR">PR #NUM</a>`, where `SUMMARY` is a short description of the PR and `META` is status context (e.g. review decision, last activity) -- both from the stdout GitHub data.
+
+**National day tooltip:** The stdout's **Today is:** line includes the day's URL in parentheses. Fetch that page and, in one or two short, factual sentences, explain what the day is and why it's observed -- skip fluffy "this day celebrates" framing, get straight to the substance. Use the Edit tool on the HTML_OUT file to set that text as the `data-desc` attribute on the `<a class="nd-label" ...>` tag (HTML-escape it), replacing whatever is currently there (often empty).
 
 Finally, open the HTML file in the browser using the path from the `HTML_OUT:` line: `open <HTML_OUT path>`
 
