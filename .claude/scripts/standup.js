@@ -18,6 +18,143 @@ const ctx = (() => {
   try { return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : {}; } catch { return {}; }
 })();
 
+// Returns true when an In Review ticket with no linked PR is non-code work.
+// Description is checked first: any mention of a PR/pull request overrides classification.
+// Then checks issue type, built-in summary patterns, and ctx.noPrKeywords.
+// Ambiguous tickets that pass through here are handled by classifyNoPrTickets (AI fallback).
+function looksLikeNoPr(row) {
+  if (/pull\s+request|merge\s+request|\bDB\s+PR\b|open\s+a\s+(PR|pull)\b|submit\s+a\s+(DB\s+)?PR\b/i.test(row.descriptionText || '')) return false;
+  const noPrTypeSet = new Set(
+    ctx.noPrTypes !== undefined
+      ? ctx.noPrTypes
+      : ['Task', 'Sub-task', 'Question', 'Documentation', 'Knowledge Article', 'Request', 'Process', 'Service Request']
+  );
+  if (row.issueType && noPrTypeSet.has(row.issueType)) return true;
+  const s = row.summary || '';
+  const builtIn = [/\bKD:/i, /\bARB\b/i, /\baccess\s+to\s+/i];
+  if (builtIn.some(re => re.test(s))) return true;
+  if (ctx.noPrKeywords?.some(kw => s.toLowerCase().includes(kw.toLowerCase()))) return true;
+  return false;
+}
+
+// Fetches OOO entries from the team M365 group calendar (GRP Dumpster Firefighters OOO).
+// Returns entries shaped like ctx.pto: { name, start, end, note }.
+// Fails silently if az CLI is unavailable or the session token is expired.
+// The group calendar's Graph dateTime values come back with timeZone: 'UTC' -- convert to the
+// team's local (Eastern) wall-clock time rather than reading the raw digits as if already local.
+const CALENDAR_DISPLAY_TZ = 'America/New_York';
+function utcGraphDateTimeToMs(dt) {
+  if (!dt) return null;
+  const ms = Date.parse(/Z$/.test(dt) ? dt : dt + 'Z');
+  return Number.isNaN(ms) ? null : ms;
+}
+// Extracts "1:00 PM" style Eastern clock time from a UTC Graph dateTime string like "2026-07-31T19:00:00.0000000"
+function fmtClockTime(dt) {
+  const ms = utcGraphDateTimeToMs(dt);
+  if (ms == null) return null;
+  return new Date(ms).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: CALENDAR_DISPLAY_TZ });
+}
+
+async function fetchGroupOOO() {
+  const GROUP_ID = '5731e1d4-4127-47f1-a547-4043adae8792';
+  const from = new Date(NOW - 30 * 86400000).toISOString().slice(0, 10);
+  try {
+    const { execSync } = require('child_process');
+    const url = `https://graph.microsoft.com/v1.0/groups/${GROUP_ID}/calendar/events` +
+      `?$filter=end/dateTime ge '${from}T00:00:00Z'&$select=subject,start,end,isAllDay&$top=100&$orderby=start/dateTime`;
+    const out = execSync(`az rest --method GET --url ${JSON.stringify(url)} 2>/dev/null`, { encoding: 'utf8', timeout: 12000 });
+    const data = JSON.parse(out);
+    const entries = [];
+    for (const ev of (data.value || [])) {
+      const m = (ev.subject || '').match(/^([A-Za-z]+(?:\s+[A-Za-z]+)?)\s+OOO(?:\s*[-–]\s*(.+))?/i);
+      if (!m) continue;
+      const name = m[1].trim();
+      const note = m[2] ? m[2].trim() : null;
+      let startDate, endDate;
+      if (ev.isAllDay) {
+        startDate = ev.start.dateTime.slice(0, 10);
+        const endDt = new Date(ev.end.dateTime);
+        endDt.setUTCDate(endDt.getUTCDate() - 1);
+        endDate = endDt.toISOString().slice(0, 10);
+        entries.push({ name, start: startDate, end: endDate, note, source: 'calendar', allDay: true });
+      } else {
+        // Time-scale OOO (e.g. a 1pm-5pm appointment): keep the clock window so getActivePto
+        // can tell "out this afternoon" apart from "out all day".
+        startDate = ev.start.dateTime.slice(0, 10);
+        endDate = ev.end.dateTime.slice(0, 10);
+        entries.push({
+          name, start: startDate, end: endDate, note, source: 'calendar', allDay: false,
+          startTime: fmtClockTime(ev.start.dateTime),
+          endTime: fmtClockTime(ev.end.dateTime),
+          startAt: utcGraphDateTimeToMs(ev.start.dateTime),
+          endAt: utcGraphDateTimeToMs(ev.end.dateTime),
+        });
+      }
+    }
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
+// Converts a Jira ADF (Atlassian Document Format) description, as a JSON string, to plain text.
+function adfToText(adfJson, maxLen = 500) {
+  try {
+    const walk = n => !n ? '' : n.text ? n.text : (n.content || []).map(walk).join(' ');
+    return walk(JSON.parse(adfJson)).replace(/\s+/g, ' ').trim().slice(0, maxLen);
+  } catch { return ''; }
+}
+
+// Calls Claude Haiku to classify In-Review tickets that slipped past looksLikeNoPr.
+// Sets row.aiNoPr = true for those that don't need a code PR.
+async function classifyNoPrTickets(rows) {
+  if (!process.env.ANTHROPIC_API_KEY) return;
+  const ambiguous = rows.filter(r => r.prSearched && !r.prActivity && !looksLikeNoPr(r));
+  if (!ambiguous.length) return;
+
+  const ticketList = ambiguous.map(r => {
+    const desc = adfToText(r.descriptionText);
+    return `${r.key} [${r.issueType}]: ${r.summary}\nDescription: ${desc}`;
+  }).join('\n\n---\n\n');
+
+  const prompt = `Classify each Jira ticket: does it require a GitHub code pull request ("needs_pr"), or is it non-code work ("no_pr_needed")?
+
+Non-code: compliance assessments (OneTrust, AIA, GRC), ServiceNow/platform team requests, access requests, documentation, knowledge articles, API key provisioning where the team requests a key from another team, and similar administrative or process work.
+
+Code (needs PR): implementing features, fixing bugs, changing codebase files (package.json, configs, CI, source code), removing/adding dependencies, updating docs that live in the repo itself, etc.
+
+Tickets to classify:
+${ticketList}
+
+Reply with ONLY a JSON object. Example: {"PARCH-123":"no_pr_needed","PARCH-456":"needs_pr"}`;
+
+  try {
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 256,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const text = data.content?.[0]?.text || '';
+    const m = text.match(/\{[\s\S]*\}/);
+    if (!m) return;
+    const result = JSON.parse(m[0]);
+    for (const row of ambiguous) {
+      if (result[row.key] === 'no_pr_needed') row.aiNoPr = true;
+    }
+  } catch { /* silent fallback */ }
+}
+
 const BASE = (process.env.JIRA_BASE_URL || '').replace(/\/$/, '');
 const EMAIL = process.env.JIRA_EMAIL;
 const TOKEN = process.env.JIRA_API_TOKEN;
@@ -49,6 +186,8 @@ const excludeTerms = [
     : []),
 ];
 const skipGithub = rawArgs.includes('--skip-github');
+const noHtml = rawArgs.includes('--no-html');
+const draftMode = rawArgs.includes('--draft');
 const isExcluded = name => excludeTerms.length > 0 && excludeTerms.some(t => normalizeN(name).includes(t));
 
 // Team membership: engineers active within this window are included even if idle now
@@ -62,13 +201,102 @@ const todayStr    = new Date(NOW).toISOString().slice(0, 10);
 const TEAM_CUTOFF = new Date(NOW - TEAM_WINDOW_DAYS * 86400000).toISOString().slice(0, 10);
 const SLE_CUTOFF  = new Date(NOW - SLE_HISTORY_DAYS * 86400000).toISOString().slice(0, 10);
 
-// Returns the active PTO entry for a name, or null
+// ── CMM observed holidays: computed once per year and cached in standup-context.json ─────────
+function nthWeekdayOfMonth(year, month, weekday, n) {
+  const d = new Date(Date.UTC(year, month, 1));
+  let count = 0;
+  while (true) {
+    if (d.getUTCDay() === weekday) { count++; if (count === n) return d.toISOString().slice(0, 10); }
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+}
+function lastWeekdayOfMonth(year, month, weekday) {
+  const d = new Date(Date.UTC(year, month + 1, 0));
+  while (d.getUTCDay() !== weekday) d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
+}
+// Federal-style observance: a holiday landing on Saturday moves to Friday, on Sunday to Monday
+function observedDate(iso) {
+  const d = new Date(iso + 'T00:00:00Z');
+  const dow = d.getUTCDay();
+  if (dow === 6) d.setUTCDate(d.getUTCDate() - 1);
+  if (dow === 0) d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+function addDaysIso(dateStr, n) {
+  const d = new Date(dateStr + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function computeUsHolidays(year) {
+  const thanksgiving = nthWeekdayOfMonth(year, 10, 4, 4); // 4th Thursday of November
+  return [
+    { name: "New Year's Day", date: observedDate(`${year}-01-01`) },
+    { name: 'MLK Day', date: nthWeekdayOfMonth(year, 0, 1, 3) }, // 3rd Monday of January
+    { name: 'Memorial Day', date: lastWeekdayOfMonth(year, 4, 1) }, // last Monday of May
+    { name: 'Juneteenth', date: observedDate(`${year}-06-19`) },
+    { name: 'Independence Day', date: observedDate(`${year}-07-04`) },
+    { name: 'Labor Day', date: nthWeekdayOfMonth(year, 8, 1, 1) }, // 1st Monday of September
+    { name: 'Thanksgiving', date: thanksgiving },
+    { name: 'Day after Thanksgiving', date: addDaysIso(thanksgiving, 1) },
+    { name: 'Christmas Day', date: observedDate(`${year}-12-25`) },
+  ].sort((a, b) => a.date.localeCompare(b.date));
+}
+
+const CURRENT_YEAR = new Date(NOW).getFullYear();
+let holidaySet;
+if (ctx.holidays && ctx.holidays.year === CURRENT_YEAR && Array.isArray(ctx.holidays.dates)) {
+  holidaySet = new Set(ctx.holidays.dates);
+} else {
+  const computed = computeUsHolidays(CURRENT_YEAR);
+  holidaySet = new Set(computed.map(h => h.date));
+  ctx.holidays = { year: CURRENT_YEAR, dates: [...holidaySet] };
+  try {
+    const fs = require('fs'), path = require('path');
+    const ctxPath = path.resolve(__dirname, '../standup-context.json');
+    const onDisk = fs.existsSync(ctxPath) ? JSON.parse(fs.readFileSync(ctxPath, 'utf8')) : {};
+    onDisk.holidays = ctx.holidays;
+    fs.writeFileSync(ctxPath, JSON.stringify(onDisk, null, 2) + '\n', 'utf8');
+  } catch { /* non-fatal: recomputed next run */ }
+}
+
+function isWorkDay(dateStr) {
+  const dow = new Date(dateStr + 'T00:00:00Z').getUTCDay();
+  return dow !== 0 && dow !== 6 && !holidaySet.has(dateStr);
+}
+// Advances to the next work day on/after dateStr, skipping weekends and CMM holidays
+function nextWorkDay(dateStr) {
+  let d = dateStr;
+  while (!isWorkDay(d)) d = addDaysIso(d, 1);
+  return d;
+}
+const NEXT_WORK_DAY = nextWorkDay(addDaysIso(todayStr, 1));
+
+// Parses a "1:00 PM" style clock time onto a given YYYY-MM-DD date, returning epoch ms (local time)
+function parseClockTime(dateStr, timeStr) {
+  const m = /^(\d{1,2}):(\d{2})\s*([AaPp][Mm])$/.exec((timeStr || '').trim());
+  if (!m) return null;
+  let hour = parseInt(m[1], 10) % 12;
+  if (/pm/i.test(m[3])) hour += 12;
+  const [y, mo, da] = dateStr.split('-').map(Number);
+  return new Date(y, mo - 1, da, hour, parseInt(m[2], 10)).getTime();
+}
+
+// Returns the active PTO/OOO entry for a name, or null. For a partial-day (allDay: false)
+// entry, "active" also requires the current time to fall within its start/end clock window --
+// someone out 1-5pm shouldn't be marked out all day.
 function getActivePto(name) {
   const nName = normalizeN(name);
   return (ctx.pto || []).find(e => {
     const nEntry = normalizeN(e.name);
-    return (nName.includes(nEntry) || nEntry.includes(nName)) &&
-           e.start <= todayStr && todayStr <= e.end;
+    if (!(nName.includes(nEntry) || nEntry.includes(nName))) return false;
+    if (!(e.start <= todayStr && todayStr <= e.end)) return false;
+    if (e.allDay === false) {
+      const startAt = e.startAt ?? (e.startTime ? parseClockTime(e.start, e.startTime) : null);
+      const endAt = e.endAt ?? (e.endTime ? parseClockTime(e.end, e.endTime) : null);
+      if (startAt != null && endAt != null) return NOW >= startAt && NOW <= endAt;
+    }
+    return true;
   }) ?? null;
 }
 
@@ -87,6 +315,34 @@ function fmtDate(iso) {
   const [, m, d] = iso.split('-');
   return ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][parseInt(m,10)-1]
     + ' ' + parseInt(d,10);
+}
+
+// Label for a PTO/OOO entry that's active right now. A partial-day (allDay: false) entry
+// shows its clock window since the person is back at work later the same day; a full-day
+// entry shows the date it runs through.
+function ptoActiveLabel(entry) {
+  if (entry.allDay === false && entry.startTime && entry.endTime) {
+    return `Out ${entry.startTime}–${entry.endTime}`;
+  }
+  return `PTO through ${fmtDate(entry.end)}`;
+}
+
+// Label for a PTO/OOO entry that hasn't started yet
+function ptoUpcomingLabel(entry) {
+  const range = entry.end > entry.start ? `${fmtDate(entry.start)}–${fmtDate(entry.end)}` : fmtDate(entry.start);
+  const timeSuffix = entry.allDay === false && entry.startTime && entry.endTime
+    ? ` (${entry.startTime}–${entry.endTime})` : '';
+  return `PTO ${range}${timeSuffix}${entry.note ? ` (${entry.note})` : ''}`;
+}
+
+// "Returns" label for an entry that's active today: a partial-day absence returns later
+// today, a full-day one returns the next work day (skipping weekends and CMM holidays)
+// after its last day.
+function ptoReturnsLabel(entry) {
+  if (entry.allDay === false && entry.startTime && entry.endTime) {
+    return `Out today ${entry.startTime}–${entry.endTime}`;
+  }
+  return `On PTO, returns ${fmtDate(nextWorkDay(addDaysIso(entry.end, 1)))}`;
 }
 
 // Static per-point SLE used for individual card ⚠ flags
@@ -122,15 +378,38 @@ async function searchAll(jql, fields, expand = null) {
   return issues;
 }
 
-async function fetchRemoteLinks(issueKey) {
+async function fetchRemoteLinks(issueKey, issueId) {
+  const prPattern = /github\.com\/[^/]+\/[^/]+\/pull\/\d+/;
+  const urls = new Set();
   try {
     const links = await jiraGet(`/rest/api/3/issue/${issueKey}/remotelink`);
-    return (Array.isArray(links) ? links : [])
-      .map(l => l.object?.url)
-      .filter(url => url && /github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(url));
-  } catch {
-    return [];
+    for (const l of (Array.isArray(links) ? links : [])) {
+      const u = l.object?.url;
+      if (u && prPattern.test(u)) urls.add(u);
+    }
+  } catch { /* ignore */ }
+  // Also check Jira's development-panel integration (GitHub app / smart commits).
+  // Must discover instance type keys via the summary first — the applicationType
+  // value varies by integration (e.g. "oAuth-com.github.integration.production").
+  if (issueId) {
+    try {
+      const summary = await jiraGet(`/rest/dev-status/1.0/issue/summary?issueId=${issueId}`);
+      const instanceTypes = Object.keys(summary?.summary?.pullrequest?.byInstanceType ?? {});
+      for (const appType of instanceTypes) {
+        try {
+          const devInfo = await jiraGet(
+            `/rest/dev-status/1.0/issue/detail?issueId=${issueId}&applicationType=${encodeURIComponent(appType)}&dataType=pullrequest`
+          );
+          for (const detail of (devInfo?.detail ?? [])) {
+            for (const pr of (detail.pullRequests ?? [])) {
+              if (pr.url && prPattern.test(pr.url)) urls.add(pr.url);
+            }
+          }
+        } catch { /* ignore */ }
+      }
+    } catch { /* ignore */ }
   }
+  return [...urls];
 }
 
 async function fetchPrActivity(prUrl) {
@@ -139,7 +418,7 @@ async function fetchPrActivity(prUrl) {
   const [, repo, num] = match;
   return new Promise(resolve => {
     require('child_process').exec(
-      `gh pr view ${num} --repo ${repo} --json updatedAt,latestReviews,reviewRequests,comments,state,reviewDecision`,
+      `gh pr view ${num} --repo ${repo} --json updatedAt,latestReviews,reviewRequests,comments,state,reviewDecision,body`,
       { timeout: 15000 },
       (err, stdout) => {
         if (err || !stdout) return resolve(null);
@@ -159,6 +438,9 @@ async function fetchPrActivity(prUrl) {
             num: parseInt(num),
             state: d.state,
             reviewDecision: d.reviewDecision,
+            // Preserve line breaks (needed for markdown headers/bullets) -- only collapse
+            // horizontal whitespace and excess blank lines.
+            body: (d.body || '').replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim(),
             reviewers: (d.latestReviews || []).map(r => ({
               author: r.author?.login, state: r.state, at: r.submittedAt,
             })),
@@ -183,7 +465,7 @@ function percentile(sorted, p) {
 }
 
 // Fetch today's national/special days from daysoftheyear.com.
-// Returns an array of day names, or null on any failure (always silent).
+// Returns an array of {name, description, dayUrl} objects, or null on any failure (always silent).
 async function fetchNationalDays() {
   try {
     const r = await fetch('https://www.daysoftheyear.com/today/', {
@@ -192,15 +474,31 @@ async function fetchNationalDays() {
     });
     if (!r.ok) return null;
     const html = await r.text();
-    const names = [];
-    const re = /<h3[^>]*>([\s\S]*?)<\/h3>/gi;
+    const days = [];
+    const re = /<h3[^>]*>([\s\S]*?)<\/h3>([\s\S]{0,600})/gi;
     let m;
     while ((m = re.exec(html)) !== null) {
-      const name = m[1].replace(/<[^>]+>/g, '').trim();
-      if (name.length >= 4 && name.length <= 80 && /day|week|month/i.test(name)) names.push(name);
-      if (names.length >= 5) break;
+      const h3Inner = m[1];
+      const afterH3 = m[2];
+      const name = h3Inner.replace(/<[^>]+>/g, '').trim();
+      if (name.length < 4 || name.length > 80 || !/day|week|month/i.test(name)) continue;
+
+      const aMatch = h3Inner.match(/href="([^"]+)"/i);
+      const dayUrl = aMatch
+        ? (aMatch[1].startsWith('http') ? aMatch[1] : 'https://www.daysoftheyear.com' + aMatch[1])
+        : 'https://www.google.com/search?q=' + encodeURIComponent(name) + '&btnI=1';
+
+      const pMatch = afterH3.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
+      let description = null;
+      if (pMatch) {
+        const raw = pMatch[1].replace(/<[^>]+>/g, '').trim();
+        if (raw.length >= 10) description = raw.length > 200 ? raw.slice(0, 197) + '…' : raw;
+      }
+
+      days.push({ name, description, dayUrl });
+      if (days.length >= 5) break;
     }
-    return names.length ? names : null;
+    return days.length ? days : null;
   } catch {
     return null;
   }
@@ -226,7 +524,7 @@ console.log = (...args) => { _origLog(...args); };
     jiraGet('/rest/api/3/field'),
     searchAll(
       `project = ${PROJECT} AND ${ACTIVE_STATUS_JQL} AND issuetype != Epic`,
-      ['assignee', 'summary', 'status', 'statuscategorychangedate', STORY_POINTS_FIELD].join(','),
+      ['assignee', 'summary', 'status', 'statuscategorychangedate', STORY_POINTS_FIELD, 'issuetype', 'description'].join(','),
       'changelog',
     ),
     // 28-day completed set for both SLE calculation and team membership (14d subset)
@@ -238,7 +536,7 @@ console.log = (...args) => { _origLog(...args); };
     // Backlog cards available to pull, oldest first
     searchAll(
       `project = ${PROJECT} AND issuetype != Epic AND status = "Selected For Development" AND assignee is EMPTY ORDER BY created ASC`,
-      `summary,components,priority,${STORY_POINTS_FIELD}`,
+      `summary,description,components,priority,${STORY_POINTS_FIELD}`,
     ),
   ]);
 
@@ -343,8 +641,11 @@ console.log = (...args) => { _origLog(...args); };
     return {
       name: issue.fields.assignee?.displayName ?? '(unassigned)',
       key: issue.key,
+      id: issue.id,
       summary: issue.fields.summary,
       status: issue.fields.status.name,
+      issueType: issue.fields.issuetype?.name ?? null,
+      descriptionText: issue.fields.description ? JSON.stringify(issue.fields.description) : '',
       ms,
       ct,
       collabs: collabsByKey.get(issue.key) ?? [],
@@ -360,7 +661,7 @@ console.log = (...args) => { _origLog(...args); };
     const reviewRows = rows.filter(r => /review/i.test(r.status));
     if (reviewRows.length) {
       const linkResults = await Promise.all(
-        reviewRows.map(r => fetchRemoteLinks(r.key).then(urls => ({ key: r.key, urls })))
+        reviewRows.map(r => fetchRemoteLinks(r.key, r.id).then(urls => ({ key: r.key, urls })))
       );
       await Promise.all(linkResults.map(async ({ key, urls }) => {
         const row = rows.find(r => r.key === key);
@@ -372,6 +673,12 @@ console.log = (...args) => { _origLog(...args); };
       }));
     }
   }
+
+  await classifyNoPrTickets(rows);
+
+  // Merge live OOO entries from the team group calendar into ctx.pto
+  const calendarOOO = await fetchGroupOOO();
+  if (calendarOOO.length) ctx.pto = [...(ctx.pto || []), ...calendarOOO];
 
   // ── National Days ───────────────────────────────────────────────────────────
   const nationalDays = await fetchNationalDays();
@@ -387,8 +694,13 @@ console.log = (...args) => { _origLog(...args); };
     h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
     h = (h ^ (h >>> 16)) >>> 0;
     pickedNationalDay = nationalDays[h % nationalDays.length];
-    console.log(`**Today is:** ${pickedNationalDay}\n`);
+    console.log(`**Today is:** ${pickedNationalDay.name} (${pickedNationalDay.dayUrl})\n`);
   }
+
+  // Weekends and CMM holidays don't count as work days -- use this date, not literal "tomorrow",
+  // whenever recommendations suggest picking something up on the next day.
+  const nextWorkDayWeekday = new Date(NEXT_WORK_DAY + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
+  console.log(`**Next work day:** ${nextWorkDayWeekday}, ${fmtDate(NEXT_WORK_DAY)}\n`);
 
   // ── Computed SLE ────────────────────────────────────────────────────────────
   console.log('## Computed SLE\n');
@@ -412,6 +724,21 @@ console.log = (...args) => { _origLog(...args); };
   }
 
   const _esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
+
+  // Minimal, safe markdown -> HTML for PR body previews in tooltips. Escapes first (so any
+  // literal HTML in the PR description can't inject markup), then layers on headers, **bold**,
+  // `code`, [text](url) links, and "- " bullets so a GitHub PR description reads like formatted
+  // text in the tooltip instead of raw markdown syntax.
+  function mdToHtml(md) {
+    const esc = _esc(md)
+      .replace(/^#{1,6}\s+(.+)$/gm, '<strong>$1</strong>')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      // single-quoted attrs: this snippet gets embedded inside a double-quoted data-summary="..." attribute
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "<a href='$2' target='_blank'>$1</a>")
+      .replace(/^[-*]\s+(.+)$/gm, '• $1');
+    return esc.split(/\n+/).map(l => l.trim()).filter(Boolean).join('<br>');
+  }
 
   function generateAgingWipSvg(inFlightRows, sleDays) {
     if (!inFlightRows.length) return '<p><em>No in-flight cards.</em></p>';
@@ -470,9 +797,10 @@ console.log = (...args) => { _origLog(...args); };
         const col = pct > 1.0 ? {f:'#ef4444',s:'#b91c1c'} : pct > 0.75 ? {f:'#f97316',s:'#ea580c'} : pct > 0.5 ? {f:'#eab308',s:'#ca8a04'} : {f:'#22c55e',s:'#16a34a'};
         const num = r.key.replace(/[^-]+-/, '');
         const url = BASE + '/browse/' + r.key;
+        const cardSummary = adfToText(r.descriptionText, 300) || r.summary;
         e.push(
           '<a href="' + url + '" target="_blank" style="text-decoration:none">' +
-          '<g class="wip-card" data-key="' + r.key + '" data-url="' + url + '" data-summary="' + _esc(r.summary) + '" data-name="' + _esc(r.name) + '" data-days="' + days + '" data-status="' + _esc(r.status) + '">' +
+          '<g class="wip-card" data-key="' + r.key + '" data-url="' + url + '" data-title="' + _esc(r.key + ' — ' + trunc(r.summary, 60)) + '" data-summary="' + _esc(cardSummary) + '" data-name="' + _esc(r.name) + '" data-days="' + days + '" data-status="' + _esc(r.status) + '">' +
           '<circle cx="' + cx + '" cy="' + cy + '" r="13" fill="' + col.f + '" stroke="' + col.s + '" stroke-width="1.5"/>' +
           '<text x="' + cx + '" y="' + cy + '" text-anchor="middle" dominant-baseline="central" fill="#fff" font-size="9" font-weight="600" font-family="system-ui,sans-serif" style="pointer-events:none">' + num + '</text>' +
           '</g></a>'
@@ -483,7 +811,7 @@ console.log = (...args) => { _origLog(...args); };
   }
 
   function generateStandupHtml({ dateLabel, nationalDay, sleDays, medianDays, sampleCount, plannedReadyCount, runwayWeeks, rows, engineerEntries, available, availSuggestions }) {
-    const ndUrl = nationalDay ? 'https://www.google.com/search?q=' + encodeURIComponent(nationalDay) + '&btnI=1' : null;
+    const ndUrl = nationalDay ? nationalDay.dayUrl : null;
     const svg = generateAgingWipSvg(rows, sleDays);
 
     let teamHtml = '';
@@ -495,29 +823,49 @@ console.log = (...args) => { _origLog(...args); };
       const ptoEntry = getActivePto(name);
       const upcoming = !ptoEntry ? getUpcomingPto(name) : [];
       const ptoTag = ptoEntry
-        ? '<span class="pto-tag">PTO through ' + fmtDate(ptoEntry.end) + '</span>'
+        ? '<span class="pto-tag' + (ptoEntry.allDay === false ? ' partial' : '') + '">' + _esc(ptoActiveLabel(ptoEntry)) + '</span>'
         : upcoming.length
-          ? '<span class="pto-tag upcoming">PTO ' + fmtDate(upcoming[0].start) + (upcoming[0].end > upcoming[0].start ? '–' + fmtDate(upcoming[0].end) : '') + '</span>'
+          ? '<span class="pto-tag upcoming">' + _esc(ptoUpcomingLabel(upcoming[0])) + '</span>'
           : '';
       let cl = '<ul class="card-list">';
       for (const r of cards) {
         const days = Math.floor(r.ms / 86400000);
         const over = days > sleDays;
         let prHtml = '';
-        if (r.prSearched) {
+        if (!r.prSearched && looksLikeNoPr(r)) {
+          prHtml = '<span class="pr-info pr-not-needed">no pr needed</span>';
+        } else if (r.prSearched) {
           if (!r.prActivity) {
-            prHtml = '<span class="pr-info pr-missing">no linked PR</span>';
+            prHtml = (looksLikeNoPr(r) || r.aiNoPr)
+              ? '<span class="pr-info pr-not-needed">no pr needed</span>'
+              : '<span class="pr-info pr-missing">no linked PR</span>';
           } else {
             const a = r.prActivity;
             const lastAgo = a.lastActivity ? humanDuration(NOW - a.lastActivity.getTime()) + ' ago' : '?';
             const dec = (a.reviewDecision || 'pending').toLowerCase().replace(/[^a-z]/g, '-');
-            prHtml = '<a href="' + _esc(a.prUrl) + '" class="pr-info pr-link" target="_blank">PR #' + a.num + '</a>' +
+            const prReviewerStr = a.reviewers.length
+              ? a.reviewers.map(rv => `${rv.author} (${rv.state})`).join(', ')
+              : a.requestedReviewers.length
+                ? a.requestedReviewers.map(n => `${n} (requested)`).join(', ')
+                : 'none assigned';
+            const prBodyTrunc = a.body ? (a.body.length > 300 ? a.body.slice(0, 300) + '…' : a.body) : '';
+            const prSummary = prBodyTrunc ? mdToHtml(prBodyTrunc) : 'No description provided.';
+            prHtml = '<a href="' + _esc(a.prUrl) + '" class="pr-info pr-link tt"' +
+              ' data-key="pr-' + a.num + '" data-title="' + _esc('PR #' + a.num + ' · ' + a.repo) + '"' +
+              // prSummary is already-safe HTML from mdToHtml (or a plain literal) -- do not re-escape
+              ' data-summary="' + prSummary + '"' +
+              ' data-meta="' + _esc((a.reviewDecision || 'pending') + ' · ' + lastAgo + ' · reviewers: ' + prReviewerStr) + '"' +
+              ' data-url="' + _esc(a.prUrl) + '" data-link-label="Open PR" target="_blank">PR #' + a.num + '</a>' +
               '<span class="pr-info pr-decision pr-' + dec + '">' + _esc(a.reviewDecision || 'pending') + '</span>' +
               '<span class="pr-info">' + _esc(lastAgo) + '</span>';
           }
         }
+        const ticketSummary = adfToText(r.descriptionText, 300) || r.summary;
         cl += '<li>' +
-          '<a href="' + BASE + '/browse/' + r.key + '" class="card-key" target="_blank">' + r.key + '</a>' +
+          '<a href="' + BASE + '/browse/' + r.key + '" class="card-key tt"' +
+          ' data-key="' + _esc(r.key) + '" data-title="' + _esc(r.key + ' — ' + trunc(r.summary, 60)) + '" data-summary="' + _esc(ticketSummary) + '"' +
+          ' data-meta="' + _esc(r.status + ' · ' + days + 'd') + '"' +
+          ' data-url="' + BASE + '/browse/' + r.key + '" target="_blank">' + r.key + '</a>' +
           '<span class="card-title">' + _esc(trunc(r.summary, 70)) + '</span>' +
           '<span class="card-status">' + _esc(r.status) + '</span>' +
           '<span class="card-age' + (over ? ' over-sle' : '') + '">' + days + 'd' + (over ? ' ⚠' : '') + '</span>' +
@@ -536,12 +884,16 @@ console.log = (...args) => { _origLog(...args); };
       if (ptoEntry) {
         teamHtml += '<div class="eng-block"><div class="eng-header">' +
           '<span class="eng-name">' + _esc(name) + '</span>' +
-          '<span class="pto-tag">PTO through ' + fmtDate(ptoEntry.end) + '</span>' +
+          '<span class="pto-tag' + (ptoEntry.allDay === false ? ' partial' : '') + '">' + _esc(ptoActiveLabel(ptoEntry)) + '</span>' +
           '</div></div>';
       } else {
         const sug = availSuggestions.get(name);
+        const sugSummary = sug ? (adfToText(sug.card.fields.description ? JSON.stringify(sug.card.fields.description) : '', 300) || sug.card.fields.summary) : '';
         const sugHtml = sug
-          ? ' → <a href="' + BASE + '/browse/' + sug.card.key + '" class="card-key" target="_blank">' + sug.card.key + '</a> ' + _esc(trunc(sug.card.fields.summary, 50)) + ' <em>(' + (sug.basis || 'next in queue') + ')</em>'
+          ? ' → <a href="' + BASE + '/browse/' + sug.card.key + '" class="card-key tt"' +
+            ' data-key="' + _esc(sug.card.key) + '" data-title="' + _esc(sug.card.key + ' — ' + trunc(sug.card.fields.summary, 60)) + '" data-summary="' + _esc(sugSummary) + '"' +
+            ' data-url="' + BASE + '/browse/' + sug.card.key + '" target="_blank">' + sug.card.key + '</a> ' +
+            _esc(trunc(sug.card.fields.summary, 50)) + ' <em>(' + (sug.basis || 'next in queue') + ')</em>'
           : ' — <em>backlog exhausted</em>';
         teamHtml += '<div class="eng-block"><div class="eng-header">' +
           '<span class="eng-name">' + _esc(name) + '</span>' +
@@ -555,8 +907,9 @@ console.log = (...args) => { _origLog(...args); };
     for (const entry of (ctx.pto || [])) {
       if (entry.end >= todayStr && entry.start <= lookahead) {
         const ongoing = entry.start <= todayStr;
-        const range = entry.end > entry.start ? fmtDate(entry.start) + '–' + fmtDate(entry.end) : fmtDate(entry.start);
-        avItems.push({ date: entry.start, html: '<strong>' + _esc(entry.name) + '</strong> — ' + (ongoing ? 'On PTO, returns ' + fmtDate(entry.end) : 'PTO ' + range) + (entry.note ? ' (' + _esc(entry.note) + ')' : '') });
+        const label = ongoing ? ptoReturnsLabel(entry) : ptoUpcomingLabel(entry);
+        const noteSuffix = ongoing && entry.note ? ' (' + _esc(entry.note) + ')' : '';
+        avItems.push({ date: entry.start, html: '<strong>' + _esc(entry.name) + '</strong> — ' + _esc(label) + noteSuffix });
       }
     }
     for (const ev of (ctx.events || [])) {
@@ -569,20 +922,23 @@ console.log = (...args) => { _origLog(...args); };
       ? '<ul class="av-list">' + avItems.map(i => '<li>' + i.html + '</li>').join('') + '</ul>'
       : '<p class="empty-note">No PTO or events in the next 30 days.</p>';
 
-    const css = '*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f1f5f9;color:#1e293b;line-height:1.6}.wrap{max-width:960px;margin:0 auto;padding:32px 20px}header{margin-bottom:28px}h1{font-size:1.7rem;font-weight:700;color:#0f172a;letter-spacing:-.02em}.tagline{margin-top:6px;color:#64748b;font-size:.93rem}.tagline a{color:#3b82f6;text-decoration:none}.tagline a:hover{text-decoration:underline}.card{background:#fff;border-radius:12px;padding:24px;margin-bottom:20px;box-shadow:0 1px 4px rgba(0,0,0,.07)}h2{font-size:1.05rem;font-weight:600;color:#0f172a;margin-bottom:16px;padding-bottom:10px;border-bottom:2px solid #f1f5f9}.metrics-row{display:flex;gap:32px;flex-wrap:wrap;font-size:.9rem;color:#475569}.metrics-row strong{color:#0f172a}.chart-wrap{margin-top:20px}.eng-block{padding:14px 0;border-bottom:1px solid #f1f5f9}.eng-block:last-child{border-bottom:none;padding-bottom:0}.eng-header{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px}.eng-name{font-weight:600;color:#0f172a;font-size:.97rem}.eng-count{color:#64748b;font-size:.85rem}.wip-badge{padding:2px 9px;border-radius:99px;font-size:.75rem;font-weight:600;text-decoration:none}.wip-badge.critical{background:#fee2e2;color:#991b1b}.wip-badge.concern{background:#fef3c7;color:#92400e}.pto-tag{background:#ede9fe;color:#5b21b6;padding:2px 8px;border-radius:99px;font-size:.75rem;font-weight:600}.pto-tag.upcoming{background:#e0f2fe;color:#0369a1}.avail-note{color:#64748b;font-size:.88rem}a.card-key{font-weight:600;color:#3b82f6;text-decoration:none;white-space:nowrap;font-size:.85rem}a.card-key:hover{text-decoration:underline}.card-list{list-style:none;padding-left:4px}.card-list li{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap;padding:4px 0;font-size:.88rem}.card-title{color:#374151}.card-status{font-weight:600;color:#0f172a;white-space:nowrap}.card-age{color:#64748b;white-space:nowrap}.card-age.over-sle{color:#ef4444;font-weight:700}.av-list{list-style:none}.av-list li{padding:7px 0;border-bottom:1px solid #f1f5f9;color:#374151;font-size:.9rem}.av-list li:last-child{border-bottom:none}.ev-note{color:#64748b;font-size:.85rem}.empty-note,.recs-placeholder{color:#94a3b8;font-style:italic;font-size:.9rem}#wip-tip{position:fixed;display:none;background:#1e293b;color:#f8fafc;padding:10px 14px;border-radius:8px;font-size:12.5px;max-width:300px;pointer-events:none;z-index:9999;line-height:1.55;box-shadow:0 4px 20px rgba(0,0,0,.35)}#wip-tip .tk{font-weight:700;font-size:13px}#wip-tip .td{margin-top:2px;color:#94a3b8;font-size:11px}#wip-tip .tl{margin-top:8px;pointer-events:auto}#wip-tip .tl a{color:#60a5fa;text-decoration:none;font-weight:600}#wip-tip .tl a:hover{text-decoration:underline}#recs-content h3{font-size:.97rem;font-weight:600;color:#0f172a;margin:20px 0 8px}#recs-content h3:first-child{margin-top:0}#recs-content p{margin-bottom:10px;color:#374151;font-size:.9rem}#recs-content ul,#recs-content ol{padding-left:20px;margin:0 0 14px;font-size:.9rem;color:#374151}#recs-content li{margin-bottom:6px;line-height:1.5}#recs-content a{color:#3b82f6;text-decoration:none}#recs-content a:hover{text-decoration:underline}.pr-info{color:#94a3b8;font-size:.8rem}.pr-missing{color:#f97316}.pr-link{color:#60a5fa;text-decoration:none}.pr-link:hover{text-decoration:underline}.pr-approved{color:#22c55e;font-weight:600}.pr-changes-requested{color:#ef4444;font-weight:600}.pr-review-required{color:#f59e0b;font-weight:600}';
-    const js = `const tip=document.getElementById("wip-tip");let pinned=false,pk=null;function showTip(el){const d=el.dataset;tip.innerHTML='<div class="tk">'+d.key+'</div><div class="td">'+d.summary+'</div><div class="td">'+d.name+' · '+d.days+'d · '+d.status+'</div><div class="tl"><a href="'+d.url+'" target="_blank">Open in Jira →</a></div>';tip.style.display='block';}tip.addEventListener('click',e=>e.stopPropagation());document.querySelectorAll('.wip-card').forEach(g=>{g.style.cursor='pointer';g.addEventListener('mouseenter',e=>{if(!pinned)showTip(e.currentTarget);});g.addEventListener('mousemove',e=>{if(!pinned){tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-40)+'px';}});g.addEventListener('mouseleave',()=>{if(!pinned)tip.style.display='none';});g.addEventListener('click',e=>{e.stopPropagation();const k=e.currentTarget.dataset.key;if(pinned&&pk===k){pinned=false;pk=null;tip.style.display='none';tip.style.pointerEvents='';}else{pinned=true;pk=k;showTip(e.currentTarget);tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-40)+'px';tip.style.pointerEvents='auto';}});});document.addEventListener('click',()=>{if(pinned){pinned=false;pk=null;tip.style.display='none';tip.style.pointerEvents='';}});document.addEventListener('keydown',e=>{if(e.key==='Escape'){pinned=false;pk=null;tip.style.display='none';tip.style.pointerEvents='';}});`;
+    const css = '*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f1f5f9;color:#1e293b;line-height:1.6}.wrap{max-width:960px;margin:0 auto;padding:32px 20px}header{margin-bottom:28px}h1{font-size:1.7rem;font-weight:700;color:#0f172a;letter-spacing:-.02em}.tagline{margin-top:6px;color:#64748b;font-size:.93rem}.tagline a{color:#3b82f6;text-decoration:none}.tagline a:hover{text-decoration:underline}.card{background:#fff;border-radius:12px;padding:24px;margin-bottom:20px;box-shadow:0 1px 4px rgba(0,0,0,.07)}h2{font-size:1.05rem;font-weight:600;color:#0f172a;margin-bottom:16px;padding-bottom:10px;border-bottom:2px solid #f1f5f9}.metrics-row{display:flex;gap:32px;flex-wrap:wrap;font-size:.9rem;color:#475569}.metrics-row strong{color:#0f172a}.chart-wrap{margin-top:20px}.eng-block{padding:14px 0;border-bottom:1px solid #f1f5f9}.eng-block:last-child{border-bottom:none;padding-bottom:0}.eng-header{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px}.eng-name{font-weight:600;color:#0f172a;font-size:.97rem}.eng-count{color:#64748b;font-size:.85rem}.wip-badge{padding:2px 9px;border-radius:99px;font-size:.75rem;font-weight:600;text-decoration:none}.wip-badge.critical{background:#fee2e2;color:#991b1b}.wip-badge.concern{background:#fef3c7;color:#92400e}.pto-tag{background:#ede9fe;color:#5b21b6;padding:2px 8px;border-radius:99px;font-size:.75rem;font-weight:600}.pto-tag.upcoming{background:#e0f2fe;color:#0369a1}.pto-tag.partial{background:#fef9c3;color:#854d0e}.avail-note{color:#64748b;font-size:.88rem}a.card-key{font-weight:600;color:#3b82f6;text-decoration:none;white-space:nowrap;font-size:.85rem}a.card-key:hover{text-decoration:underline}.card-list{list-style:none;padding-left:4px}.card-list li{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap;padding:4px 0;font-size:.88rem}.card-title{color:#374151}.card-status{font-weight:600;color:#0f172a;white-space:nowrap}.card-age{color:#64748b;white-space:nowrap}.card-age.over-sle{color:#ef4444;font-weight:700}.av-list{list-style:none}.av-list li{padding:7px 0;border-bottom:1px solid #f1f5f9;color:#374151;font-size:.9rem}.av-list li:last-child{border-bottom:none}.ev-note{color:#64748b;font-size:.85rem}.empty-note,.recs-placeholder{color:#94a3b8;font-style:italic;font-size:.9rem}#wip-tip{position:fixed;display:none;background:#1e293b;color:#f8fafc;padding:10px 14px;border-radius:8px;font-size:12.5px;max-width:300px;pointer-events:none;z-index:9999;line-height:1.55;box-shadow:0 4px 20px rgba(0,0,0,.35)}#wip-tip .tk{font-weight:700;font-size:13px}#wip-tip .td{margin-top:2px;color:#94a3b8;font-size:11px}#wip-tip .tl{margin-top:8px;pointer-events:auto}#wip-tip .tl a{color:#60a5fa;text-decoration:none;font-weight:600}#wip-tip .tl a:hover{text-decoration:underline}#recs-content h3{font-size:.97rem;font-weight:600;color:#0f172a;margin:20px 0 8px}#recs-content h3:first-child{margin-top:0}#recs-content p{margin-bottom:10px;color:#374151;font-size:.9rem}#recs-content ul,#recs-content ol{padding-left:20px;margin:0 0 14px;font-size:.9rem;color:#374151}#recs-content li{margin-bottom:6px;line-height:1.5}#recs-content a{color:#3b82f6;text-decoration:none}#recs-content a:hover{text-decoration:underline}.pr-info{color:#94a3b8;font-size:.8rem}.pr-missing{color:#f97316}.pr-not-needed{color:#16a34a;font-weight:500}.pr-link{color:#60a5fa;text-decoration:none}.pr-link:hover{text-decoration:underline}.pr-approved{color:#22c55e;font-weight:600}.pr-changes-requested{color:#ef4444;font-weight:600}.pr-review-required{color:#f59e0b;font-weight:600}.monitor-entry{padding:8px 0;border-bottom:1px solid #f1f5f9;font-size:.88rem;color:#374151}.monitor-entry:last-child{border-bottom:none}.monitor-time{font-weight:600;color:#0f172a}.monitor-nochange{color:#94a3b8;font-style:italic}.rec-added{border-left:3px solid #22c55e;padding:4px 0 4px 12px;margin-bottom:12px;background:#f0fdf4;border-radius:0 6px 6px 0}.rec-removed{border-left:3px solid #ef4444;padding:4px 0 4px 12px;margin-bottom:12px;background:#fff1f2;border-radius:0 6px 6px 0;opacity:.8}.rec-badge{font-size:.75rem;font-weight:700;margin-right:4px}.rec-added .rec-badge::before{content:"✚ ";color:#16a34a}.rec-removed .rec-badge::before{content:"✕ ";color:#dc2626}.rec-removed h3,.rec-removed p,.rec-removed li{text-decoration:line-through;color:#9ca3af}#nd-tip{position:fixed;display:none;background:#1e293b;color:#f8fafc;padding:10px 14px;border-radius:8px;font-size:12.5px;max-width:280px;pointer-events:none;z-index:9999;line-height:1.55;box-shadow:0 4px 20px rgba(0,0,0,.35)}#nd-tip .nd-desc{color:#cbd5e1;font-size:12px}.nd-label{border-bottom:1px dashed currentColor;text-decoration:none!important}.nd-label:hover{opacity:.85}';
+    const js = `const tip=document.getElementById("wip-tip");let pinned=false,pk=null;function showTip(el){const d=el.dataset;const title=d.title||d.key||'';const meta=d.meta||[d.name,d.days?d.days+'d':null,d.status].filter(Boolean).join(' · ');let h='<div class="tk">'+title+'</div>';if(d.summary)h+='<div class="td">'+d.summary+'</div>';if(meta)h+='<div class="td">'+meta+'</div>';if(d.url)h+='<div class="tl"><a href="'+d.url+'" target="_blank">'+(d.linkLabel||'Open in Jira')+' →</a></div>';tip.innerHTML=h;tip.style.display='block';}tip.addEventListener('click',e=>e.stopPropagation());document.querySelectorAll('.wip-card, .tt').forEach(g=>{g.style.cursor='pointer';g.addEventListener('mouseenter',e=>{if(!pinned)showTip(e.currentTarget);});g.addEventListener('mousemove',e=>{if(!pinned){tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-40)+'px';}});g.addEventListener('mouseleave',()=>{if(!pinned)tip.style.display='none';});g.addEventListener('click',e=>{e.stopPropagation();const k=e.currentTarget.dataset.key;if(pinned&&pk===k){pinned=false;pk=null;tip.style.display='none';tip.style.pointerEvents='';}else{pinned=true;pk=k;showTip(e.currentTarget);tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY-40)+'px';tip.style.pointerEvents='auto';}});});document.addEventListener('click',()=>{if(pinned){pinned=false;pk=null;tip.style.display='none';tip.style.pointerEvents='';}});document.addEventListener('keydown',e=>{if(e.key==='Escape'){pinned=false;pk=null;tip.style.display='none';tip.style.pointerEvents='';}});(function(){var el=document.getElementById('recs-content');if(el&&el.innerHTML.indexOf('RECOMMENDATIONS_PLACEHOLDER')!==-1){el.innerHTML='<p class="recs-placeholder">Recommendations loading…</p>';var iv=setInterval(function(){location.reload();},2000);setTimeout(function(){clearInterval(iv);},60000);}})();(function(){var ml=document.getElementById('monitor-log');var mc=document.getElementById('monitoring');if(ml&&mc&&ml.innerHTML.indexOf('MONITORING_LOG_PLACEHOLDER')===-1){mc.style.display='';}var iv2=setInterval(function(){if(ml&&mc&&ml.innerHTML.indexOf('MONITORING_LOG_PLACEHOLDER')===-1){mc.style.display='';clearInterval(iv2);}},3000);})();(function(){var nl=document.querySelector('.nd-label');var nt=document.getElementById('nd-tip');if(!nl||!nt)return;var dd=nt.querySelector('.nd-desc');nl.addEventListener('mouseenter',function(e){var desc=nl.dataset.desc;if(!desc)return;dd.textContent=desc;nt.style.left=(e.clientX+14)+'px';nt.style.top=(e.clientY-40)+'px';nt.style.display='block';});nl.addEventListener('mousemove',function(e){nt.style.left=(e.clientX+14)+'px';nt.style.top=(e.clientY-40)+'px';});nl.addEventListener('mouseleave',function(){nt.style.display='none';});})();`;
 
     return '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>' + _esc(PROJECT) + ' Standup — ' + _esc(dateLabel) + '</title>\n<style>' + css + '</style>\n</head>\n<body>\n<div class="wrap">\n' +
       '<header><h1>' + _esc(PROJECT) + ' Standup — ' + _esc(dateLabel) + '</h1>' +
-      (nationalDay ? '<p class="tagline">Today is: <a href="' + ndUrl + '" target="_blank">' + _esc(nationalDay) + '</a></p>' : '') +
+      (nationalDay ? '<p class="tagline">Today is: <a class="nd-label" href="' + _esc(ndUrl || '#') + '" target="_blank" data-desc="' + _esc(nationalDay.description || '') + '">' + _esc(nationalDay.name) + '</a></p>' : '') +
       '</header>\n' +
-      '<div class="card"><h2>Kanban Metrics</h2>' +
+      '<!-- SEC:metrics -->\n<div class="card" id="kanban-metrics"><h2>Kanban Metrics</h2>' +
       '<div class="metrics-row"><span><strong>85th Percentile (SLE):</strong> ' + sleDays + ' days</span><span><strong>Median:</strong> ' + medianDays + ' days</span><span><strong>Sample:</strong> ' + sampleCount + ' completed cards (last 28 days)</span><span><strong>Runway:</strong> ' + plannedReadyCount + ' ready card' + (plannedReadyCount !== 1 ? 's' : '') + (runwayWeeks !== null ? ' (~' + runwayWeeks + 'w)' : '') + '</span></div>' +
-      '<div class="chart-wrap">' + svg + '</div></div>\n' +
-      '<div class="card"><h2>Team Status</h2>' + teamHtml + '</div>\n' +
+      '<div class="chart-wrap">' + svg + '</div></div>\n<!-- /SEC:metrics -->\n' +
+      '<!-- SEC:team -->\n<div class="card" id="team-status"><h2>Team Status</h2>' + teamHtml + '</div>\n<!-- /SEC:team -->\n' +
       '<div class="card" id="recommendations"><h2>Recommendations</h2><div id="recs-content"><!-- RECOMMENDATIONS_PLACEHOLDER --></div></div>\n' +
       '<div class="card"><h2>Availability and Upcoming Events</h2>' + avHtml + '</div>\n' +
-      '</div>\n<div id="wip-tip"></div>\n<script>' + js + '<\/script>\n</body>\n</html>';
+      '<!-- SEC:monitor -->\n<div class="card" id="monitoring" style="display:none"><h2>Live Updates <span id="monitor-last-checked" style="font-size:.8rem;font-weight:400;color:#6b7280"></span></h2><div id="monitor-log"><!-- MONITORING_LOG_PLACEHOLDER --></div></div>\n<!-- /SEC:monitor -->\n' +
+      '</div>\n<div id="wip-tip"></div><div id="nd-tip"><div class="nd-desc"></div></div>\n<script>' + js + '<\/script>\n' +
+      '<script>(function(){var _ids=[\'monitor-log\',\'kanban-metrics\',\'team-status\',\'recs-content\',\'monitor-last-checked\'];var _kn={};_ids.forEach(function(id){var el=document.getElementById(id);_kn[id]=el?el.innerHTML:\'\';});setInterval(function(){var xhr=new XMLHttpRequest();xhr.open(\'GET\',location.href,true);xhr.onload=function(){try{var doc=new DOMParser().parseFromString(xhr.responseText,\'text/html\');_ids.forEach(function(id){var nel=doc.getElementById(id);var oel=document.getElementById(id);if(nel&&oel&&nel.innerHTML!==_kn[id]){_kn[id]=nel.innerHTML;oel.innerHTML=nel.innerHTML;if(id===\'monitor-log\'||id===\'monitor-last-checked\'){var mc=document.getElementById(\'monitoring\');if(mc)mc.style.display=\'\';}}})}catch(e){}};xhr.send();},15000);})();<\/script>\n' +
+      '</body>\n</html>';
   }
 
   // Group in-flight rows by engineer; sort each engineer's cards right-to-left then longest first
@@ -646,20 +1002,19 @@ console.log = (...args) => { _origLog(...args); };
     const pto = getActivePto(name);
     const upcomingPto = !pto ? getUpcomingPto(name) : [];
     const ptoTag = pto
-      ? ` · PTO through ${fmtDate(pto.end)}`
+      ? ` · ${ptoActiveLabel(pto)}`
       : upcomingPto.length
-        ? ' · _' + upcomingPto.map(e => {
-            const range = e.end > e.start ? `${fmtDate(e.start)}–${fmtDate(e.end)}` : fmtDate(e.start);
-            return `PTO ${range}${e.note ? ` (${e.note})` : ''}`;
-          }).join(', ') + '_'
+        ? ' · _' + upcomingPto.map(ptoUpcomingLabel).join(', ') + '_'
         : '';
     console.log(`**${name}**${ptoTag} · ${cards.length} card${cards.length !== 1 ? 's' : ''}  `);
     for (const r of cards) {
       const link = `[${r.key}](${BASE}/browse/${r.key})`;
       console.log(`- ${link} ${trunc(r.summary, 60)} · **${r.status}** · ${r.ct}`);
-      if (r.prSearched) {
+      if (!r.prSearched && looksLikeNoPr(r)) {
+        console.log(`  - no PR needed`);
+      } else if (r.prSearched) {
         if (!r.prActivity) {
-          console.log(`  - GitHub: no linked PR found`);
+          console.log((looksLikeNoPr(r) || r.aiNoPr) ? `  - no PR needed` : `  - GitHub: no linked PR found`);
         } else {
           const a = r.prActivity;
           const lastAgo = a.lastActivity ? humanDuration(NOW - a.lastActivity.getTime()) + ' ago' : 'unknown';
@@ -677,16 +1032,12 @@ console.log = (...args) => { _origLog(...args); };
   for (const name of available) {
     const pto = getActivePto(name);
     if (pto) {
-      const through = pto.end > todayStr ? ` through ${fmtDate(pto.end)}` : '';
       const noteStr = pto.note ? ` (${pto.note})` : '';
-      console.log(`**${name}** · PTO${through}${noteStr}`);
+      console.log(`**${name}** · ${ptoActiveLabel(pto)}${noteStr}`);
       continue;
     }
     const upcoming = getUpcomingPto(name);
-    const upcomingStr = upcoming.map(e => {
-      const range = e.end > e.start ? `${fmtDate(e.start)}–${fmtDate(e.end)}` : fmtDate(e.start);
-      return `PTO ${range}${e.note ? ` (${e.note})` : ''}`;
-    }).join(', ');
+    const upcomingStr = upcoming.map(ptoUpcomingLabel).join(', ');
     const upcomingSuffix = upcomingStr ? ` · _${upcomingStr}_` : '';
 
     const suggestion = availSuggestions.get(name);
@@ -739,25 +1090,58 @@ console.log = (...args) => { _origLog(...args); };
     }
   }
 
-  // ── Write standup.html ───────────────────────────────────────────────────────
-  const _fs = require('fs'), _path = require('path');
+  // ── Write standup HTML to a dated temp file ──────────────────────────────────
+  const _fs = require('fs'), _path = require('path'), _os = require('os');
   const medianDays = cycleTimes.length ? Math.round(percentile(cycleTimes, 0.5) / 86400000) : 0;
-  _fs.writeFileSync(
-    _path.resolve(process.cwd(), 'standup.html'),
-    generateStandupHtml({
-      dateLabel: todayLabel,
-      nationalDay: pickedNationalDay,
-      sleDays: computedSleDays,
-      medianDays,
-      sampleCount: cycleTimes.length,
-      plannedReadyCount,
-      runwayWeeks,
-      rows,
-      engineerEntries,
-      available,
-      availSuggestions,
-    }),
-    'utf8',
-  );
+  const _sDate = new Date().toISOString().slice(0, 10);
+  const _sOut = _path.join(_os.tmpdir(), `standup-${_sDate}${draftMode ? '-draft' : ''}.html`);
+  if (!noHtml) {
+    _fs.writeFileSync(
+      _sOut,
+      generateStandupHtml({
+        dateLabel: todayLabel,
+        nationalDay: pickedNationalDay,
+        sleDays: computedSleDays,
+        medianDays,
+        sampleCount: cycleTimes.length,
+        plannedReadyCount,
+        runwayWeeks,
+        rows,
+        engineerEntries,
+        available,
+        availSuggestions,
+      }),
+      'utf8',
+    );
+    console.log('HTML_OUT:' + _sOut);
+    if (!draftMode) {
+      const { execSync: _execSync, spawn: _spawn } = require('child_process');
+      const _path = require('path');
+      const _port = 8765;
+      const _tmpDir = _path.dirname(_sOut);
+      const _fileName = _path.basename(_sOut);
+      const _url = `http://localhost:${_port}/${_fileName}`;
+      const _opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
+
+      let _srvRunning = false;
+      try { _execSync(`lsof -ti:${_port}`, { stdio: 'pipe' }); _srvRunning = true; } catch {}
+
+      if (!_srvRunning) {
+        const _srv = _spawn('python3', ['-m', 'http.server', String(_port), '--bind', '127.0.0.1', '--directory', _tmpDir], {
+          detached: true, stdio: 'ignore',
+        });
+        _srv.unref();
+        // Auto-kill after 1 hour
+        const _killer = _spawn('bash', ['-c', `sleep 3600 && kill ${_srv.pid} 2>/dev/null`], {
+          detached: true, stdio: 'ignore',
+        });
+        _killer.unref();
+        // Give server a moment to start before opening browser
+        _execSync(`bash -c 'sleep 0.6 && ${_opener} "${_url}"' &`);
+      } else {
+        try { _execSync(`${_opener} "${_url}"`); } catch {}
+      }
+    }
+  }
 
 })().catch(e => { console.error(e.message); process.exit(1); });
