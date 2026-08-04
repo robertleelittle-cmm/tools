@@ -23,6 +23,8 @@ node .claude/scripts/standup.js $ARGUMENTS
 
 The script writes the HTML report to a dated temp file, opens it in the default browser, and prints the exact output path to stdout on a line starting with `HTML_OUT:`. It also outputs a markdown data summary to stdout.
 
+**If stdout contains a line starting with `**OOO calendar unavailable:**`:** the az CLI session is logged into the wrong Azure tenant to read the OOO group calendar, so calendar-based PTO/OOO was silently skipped for this run. Use AskUserQuestion to ask whether to log into the correct tenant now (`az login --tenant da67ef1b-ca59-4db2-9a8c-aa8d94617a16`, which opens a browser auth flow) and re-run the standup, or continue without it. Don't run the login without asking first.
+
 Once you have the stdout output:
 
 1. Display the **Computed SLE** and **Team Status** sections verbatim, without any modification or commentary.
